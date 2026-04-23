@@ -69,6 +69,7 @@ class NodeInfo:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def sha256_of(data: bytes) -> str:
+    """Compute and return the SHA-256 hexadecimal checksum of the given bytes."""
     return hashlib.sha256(data).hexdigest()
 
 
