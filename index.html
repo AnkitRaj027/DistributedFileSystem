@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DFS Dashboard — Distributed File System</title>
+  <meta name="description" content="Real-time dashboard for a distributed file system with fault tolerance, multi-node replication, and integrity verification." />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<!-- Decorative animated network lines -->
+<div class="network-lines" id="network-lines" aria-hidden="true"></div>
+
+<!-- Toast container -->
+<div id="toast-container" aria-live="polite"></div>
+
+<div class="app-wrapper">
+
+  <!-- ── Header ──────────────────────────────────────────────────────────── -->
+  <header class="site-header">
+    <div class="brand">
+      <div class="brand-icon" aria-hidden="true">🗄️</div>
+      <div class="brand-text">
+        <h1>DistributedFS</h1>
+        <p>Fault-Tolerant Distributed File System</p>
+      </div>
+    </div>
+    <div class="header-right">
+      <div class="connection-pill">
+        <span class="dot"></span>
+        Cluster Online
+      </div>
+      <button class="btn btn-ghost" id="btn-refresh" title="Refresh all data">
+        🔄 Refresh
+      </button>
+    </div>
+  </header>
+
+  <!-- ── Stats Strip ─────────────────────────────────────────────────────── -->
+  <section class="stat-strip" aria-label="System statistics">
+
+    <div class="stat-card">
+      <div class="stat-label">Total Nodes</div>
+      <div class="stat-value blue" id="stat-total-nodes">—</div>
+      <div class="stat-sub">in cluster</div>
+    </div>
+
+    <div class="stat-card">
+      <div class="stat-label">Online Nodes</div>
+      <div class="stat-value green" id="stat-online-nodes">—</div>
+      <div class="stat-sub">healthy &amp; serving</div>
+    </div>
+
+    <div class="stat-card">
+      <div class="stat-label">Availability</div>
+      <div class="stat-value violet" id="stat-availability">—</div>
+      <div class="stat-sub">node availability</div>
+    </div>
+
+    <div class="stat-card">
+      <div class="stat-label">Total Files</div>
+      <div class="stat-value blue" id="stat-total-files">—</div>
+      <div class="stat-sub">stored in DFS</div>
+    </div>
+
+    <div class="stat-card">
+      <div class="stat-label">Files at Risk</div>
+      <div class="stat-value amber" id="stat-at-risk">—</div>
+      <div class="stat-sub">under-replicated</div>
+    </div>
+
+    <div class="stat-card">
+      <div class="stat-label">Data Stored</div>
+      <div class="stat-value green" id="stat-bytes">—</div>
+      <div class="stat-sub">across all nodes</div>
+    </div>
+
+  </section>
+
+  <!-- ── Main Grid ───────────────────────────────────────────────────────── -->
+  <main class="main-grid">
+
+    <!-- ── Node Topology Panel ─────────────────────────────────────────── -->
+    <section class="panel" aria-labelledby="nodes-heading">
+      <div class="panel-header">
+        <div class="panel-title">
+          <span class="panel-icon">🌐</span>
+          <span id="nodes-heading">Cluster Nodes</span>
+        </div>
+        <div class="flex-row gap-8">
+          <button class="btn btn-primary btn-sm" id="btn-add-node">
+            ＋ Add Node
+          </button>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div class="node-grid" id="node-grid">
+          <!-- Populated by JS -->
+        </div>
+
+        <div class="divider"></div>
+
+        <!-- Replication Factor Control -->
+        <div class="flex-row gap-12">
+          <span style="font-size:0.82rem; color:var(--text-secondary); font-weight:500;">
+            Replication Factor
+          </span>
+          <div class="rf-control">
+            <div class="rf-stepper">
+              <button class="rf-btn" id="rf-minus" aria-label="Decrease replication factor">−</button>
+              <div class="rf-value" id="rf-display">2</div>
+              <button class="rf-btn" id="rf-plus" aria-label="Increase replication factor">＋</button>
+            </div>
+          </div>
+          <span class="text-muted">copies per chunk</span>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ── Upload Panel ────────────────────────────────────────────────── -->
+    <section class="panel" aria-labelledby="upload-heading">
+      <div class="panel-header">
+        <div class="panel-title">
+          <span class="panel-icon">📤</span>
+          <span id="upload-heading">Upload Files</span>
+        </div>
+        <span class="badge badge-violet">Auto-replicated</span>
+      </div>
+      <div class="panel-body">
+
+        <div class="upload-zone" id="upload-zone" role="button" tabindex="0"
+             aria-label="Upload zone — drag and drop files or click to browse">
+          <input type="file" id="file-input" multiple aria-label="File input" />
+          <span class="upload-icon">📁</span>
+          <h3>Drop files here</h3>
+          <p>or click to browse — any file type supported</p>
+        </div>
+
+        <div class="progress-container" id="upload-progress">
+          <div class="progress-bar-track">
+            <div class="progress-bar-fill" id="progress-fill"></div>
+          </div>
+          <div class="progress-label" id="progress-label">Preparing…</div>
+        </div>
+
+        <div class="divider"></div>
+
+        <div style="display:flex; flex-direction:column; gap:10px;">
+
+          <div style="display:flex; align-items:center; gap:10px; padding:10px 14px;
+                      background:rgba(79,142,255,0.05); border:1px solid rgba(79,142,255,0.15);
+                      border-radius:var(--radius-sm); font-size:0.78rem;">
+            <span>🔐</span>
+            <span style="color:var(--text-secondary);">SHA-256 checksum computed and verified on every read</span>
+          </div>
+
+          <div style="display:flex; align-items:center; gap:10px; padding:10px 14px;
+                      background:rgba(16,185,129,0.05); border:1px solid rgba(16,185,129,0.15);
+                      border-radius:var(--radius-sm); font-size:0.78rem;">
+            <span>🔄</span>
+            <span style="color:var(--text-secondary);">Files auto-split into 512 KB chunks and distributed</span>
+          </div>
+
+          <div style="display:flex; align-items:center; gap:10px; padding:10px 14px;
+                      background:rgba(139,92,246,0.05); border:1px solid rgba(139,92,246,0.15);
+                      border-radius:var(--radius-sm); font-size:0.78rem;">
+            <span>⚡</span>
+            <span style="color:var(--text-secondary);">Automatic failover — reads from any healthy replica</span>
+          </div>
+
+        </div>
+      </div>
+    </section>
+
+    <!-- ── File System Panel ───────────────────────────────────────────── -->
+    <section class="panel full-width" aria-labelledby="files-heading">
+      <div class="panel-header">
+        <div class="panel-title">
+          <span class="panel-icon">📂</span>
+          <span id="files-heading">Distributed File Registry</span>
+        </div>
+        <span class="text-muted">Auto-updates every 2.5s</span>
+      </div>
+      <div class="panel-body" style="padding:0;">
+        <div class="file-table-wrapper">
+          <table class="file-table" aria-label="Distributed files list">
+            <thead>
+              <tr>
+                <th>File</th>
+                <th>Size</th>
+                <th>Chunks</th>
+                <th>Nodes (Replicas)</th>
+                <th>Uploaded</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="file-tbody">
+              <tr><td colspan="6">
+                <div class="empty-state">
+                  <div class="emoji">⏳</div>
+                  <p>Loading…</p>
+                </div>
+              </td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Event Log Panel ─────────────────────────────────────────────── -->
+    <section class="panel full-width" aria-labelledby="events-heading">
+      <div class="panel-header">
+        <div class="panel-title">
+          <span class="panel-icon">📡</span>
+          <span id="events-heading">System Event Log</span>
+        </div>
+        <button class="btn btn-ghost btn-sm" onclick="document.getElementById('event-log').innerHTML=''">
+          Clear
+        </button>
+      </div>
+      <div class="panel-body">
+        <div class="event-log" id="event-log" aria-live="polite" aria-label="System event log">
+          <div class="empty-state" style="padding:24px;">
+            <div class="emoji" style="font-size:1.8rem;">📻</div>
+            <p>Waiting for cluster events…</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Fault Tolerance Info Panel ─────────────────────────────────── -->
+    <section class="panel full-width" aria-labelledby="ft-heading">
+      <div class="panel-header">
+        <div class="panel-title">
+          <span class="panel-icon">🛡️</span>
+          <span id="ft-heading">Fault Tolerance Mechanisms</span>
+        </div>
+        <span class="badge badge-blue">Active</span>
+      </div>
+      <div class="panel-body">
+        <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap:16px;">
+
+          <div style="padding:16px; background:rgba(255,255,255,0.025); border:1px solid var(--border-subtle); border-radius:var(--radius-md);">
+            <div style="font-size:1.5rem; margin-bottom:8px;">💓</div>
+            <div style="font-weight:600; margin-bottom:4px; font-size:0.88rem;">Heartbeat Monitoring</div>
+            <div style="font-size:0.75rem; color:var(--text-muted);">Nodes report every 2s. Declared DEAD after 6s silence. Automatic re-replication triggered.</div>
+          </div>
+
+          <div style="padding:16px; background:rgba(255,255,255,0.025); border:1px solid var(--border-subtle); border-radius:var(--radius-md);">
+            <div style="font-size:1.5rem; margin-bottom:8px;">📋</div>
+            <div style="font-weight:600; margin-bottom:4px; font-size:0.88rem;">Multi-Node Replication</div>
+            <div style="font-size:0.75rem; color:var(--text-muted);">Each file chunk is replicated to N nodes (configurable). Maintains availability during failures.</div>
+          </div>
+
+          <div style="padding:16px; background:rgba(255,255,255,0.025); border:1px solid var(--border-subtle); border-radius:var(--radius-md);">
+            <div style="font-size:1.5rem; margin-bottom:8px;">🔐</div>
+            <div style="font-weight:600; margin-bottom:4px; font-size:0.88rem;">SHA-256 Integrity</div>
+            <div style="font-size:0.75rem; color:var(--text-muted);">Every chunk checksum is verified on read. Corrupted data is detected and flagged immediately.</div>
+          </div>
+
+          <div style="padding:16px; background:rgba(255,255,255,0.025); border:1px solid var(--border-subtle); border-radius:var(--radius-md);">
+            <div style="font-size:1.5rem; margin-bottom:8px;">⚡</div>
+            <div style="font-weight:600; margin-bottom:4px; font-size:0.88rem;">Automatic Failover</div>
+            <div style="font-size:0.75rem; color:var(--text-muted);">Downloads automatically retry across all healthy replicas. Zero manual intervention required.</div>
+          </div>
+
+          <div style="padding:16px; background:rgba(255,255,255,0.025); border:1px solid var(--border-subtle); border-radius:var(--radius-md);">
+            <div style="font-size:1.5rem; margin-bottom:8px;">🔄</div>
+            <div style="font-weight:600; margin-bottom:4px; font-size:0.88rem;">Auto Re-replication</div>
+            <div style="font-size:0.75rem; color:var(--text-muted);">Under-replicated chunks are automatically redistributed to healthy nodes when a failure is detected.</div>
+          </div>
+
+          <div style="padding:16px; background:rgba(255,255,255,0.025); border:1px solid var(--border-subtle); border-radius:var(--radius-md);">
+            <div style="font-size:1.5rem; margin-bottom:8px;">🌐</div>
+            <div style="font-weight:600; margin-bottom:4px; font-size:0.88rem;">Dynamic Scaling</div>
+            <div style="font-size:0.75rem; color:var(--text-muted);">Add/remove nodes at runtime. New nodes join the cluster immediately and accept new replication targets.</div>
+          </div>
+
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<script src="script.js"></script>
+</body>
+</html>
