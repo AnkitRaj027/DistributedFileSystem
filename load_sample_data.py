@@ -22,7 +22,7 @@ def analyze_data(filepath):
             'min': min(values)
         }
     return results
-
+#computing check_sum
 def compute_checksum(data):
     return hashlib.sha256(data.encode()).hexdigest()
 
