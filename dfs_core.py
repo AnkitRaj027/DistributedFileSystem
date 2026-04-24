@@ -16,7 +16,7 @@ from enum import Enum
 # ─────────────────────────────────────────────────────────────────────────────
 # Enums & Constants
 # ─────────────────────────────────────────────────────────────────────────────
-
+#node statusS
 class NodeStatus(str, Enum):
     ONLINE     = "online"
     OFFLINE    = "offline"
