@@ -3,281 +3,382 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>DFS Dashboard — Distributed File System</title>
-  <meta name="description" content="Real-time dashboard for a distributed file system with fault tolerance, multi-node replication, and integrity verification." />
+  <title>DistributedFS — Next-Gen Distributed File System</title>
+  <meta name="description" content="Enterprise-grade distributed file system with AES-256 encryption, zlib compression, concurrent replication, and real-time cluster topology visualization." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <!-- vis-network for topology graph -->
+  <script src="https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
 
-<!-- Decorative animated network lines -->
-<div class="network-lines" id="network-lines" aria-hidden="true"></div>
+<!-- Animated background particles -->
+<div class="bg-particles" id="bg-particles" aria-hidden="true"></div>
 
 <!-- Toast container -->
-<div id="toast-container" aria-live="polite"></div>
+<div id="toast-container" aria-live="polite" role="status"></div>
+
+<!-- Modal overlay -->
+<div class="modal-overlay" id="modal-overlay" aria-hidden="true">
+  <div class="modal" id="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal-header">
+      <h3 id="modal-title">Integrity Report</h3>
+      <button class="modal-close" id="modal-close" aria-label="Close modal">✕</button>
+    </div>
+    <div class="modal-body" id="modal-body"></div>
+  </div>
+</div>
 
 <div class="app-wrapper">
 
-  <!-- ── Header ──────────────────────────────────────────────────────────── -->
-  <header class="site-header">
-    <div class="brand">
-      <div class="brand-icon" aria-hidden="true">🗄️</div>
+  <!-- ── Sidebar ──────────────────────────────────────────────────────────── -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-brand">
+      <div class="brand-logo" aria-hidden="true">
+        <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
+          <circle cx="14" cy="14" r="13" stroke="url(#g1)" stroke-width="1.5"/>
+          <circle cx="14" cy="9"  r="3" fill="url(#g1)"/>
+          <circle cx="8"  cy="19" r="3" fill="url(#g2)"/>
+          <circle cx="20" cy="19" r="3" fill="url(#g2)"/>
+          <line x1="14" y1="12" x2="8"  y2="19" stroke="url(#g1)" stroke-width="1.2"/>
+          <line x1="14" y1="12" x2="20" y2="19" stroke="url(#g1)" stroke-width="1.2"/>
+          <defs>
+            <linearGradient id="g1" x1="0" y1="0" x2="28" y2="28" gradientUnits="userSpaceOnUse">
+              <stop stop-color="#6366f1"/>
+              <stop offset="1" stop-color="#06b6d4"/>
+            </linearGradient>
+            <linearGradient id="g2" x1="0" y1="0" x2="28" y2="28" gradientUnits="userSpaceOnUse">
+              <stop stop-color="#8b5cf6"/>
+              <stop offset="1" stop-color="#06b6d4"/>
+            </linearGradient>
+          </defs>
+        </svg>
+      </div>
       <div class="brand-text">
-        <h1>DistributedFS</h1>
-        <p>Fault-Tolerant Distributed File System</p>
+        <span class="brand-name">DistributedFS</span>
+        <span class="brand-tag">v2.0 Enterprise</span>
       </div>
     </div>
-    <div class="header-right">
-      <div class="connection-pill">
-        <span class="dot"></span>
-        Cluster Online
+
+    <nav class="sidebar-nav" aria-label="Main navigation">
+      <a href="#" class="nav-item active" data-section="overview" id="nav-overview">
+        <span class="nav-icon">⬡</span> Overview
+      </a>
+      <a href="#" class="nav-item" data-section="topology" id="nav-topology">
+        <span class="nav-icon">⛶</span> Topology
+      </a>
+      <a href="#" class="nav-item" data-section="files" id="nav-files">
+        <span class="nav-icon">◫</span> Files
+      </a>
+      <a href="#" class="nav-item" data-section="upload" id="nav-upload">
+        <span class="nav-icon">⬆</span> Upload
+      </a>
+      <a href="#" class="nav-item" data-section="events" id="nav-events">
+        <span class="nav-icon">◉</span> Events
+        <span class="nav-badge" id="nav-event-count">0</span>
+      </a>
+    </nav>
+
+    <div class="sidebar-footer">
+      <div class="security-chips">
+        <div class="chip chip-green" id="chip-encrypt">🔐 AES-256</div>
+        <div class="chip chip-blue" id="chip-compress">📦 zlib</div>
+        <div class="chip chip-violet" id="chip-parallel">⚡ Parallel</div>
       </div>
-      <button class="btn btn-ghost" id="btn-refresh" title="Refresh all data">
-        🔄 Refresh
-      </button>
+      <div class="cluster-pill" id="cluster-status-pill">
+        <span class="pulse-dot"></span>
+        <span id="cluster-status-text">Cluster Online</span>
+      </div>
     </div>
-  </header>
+  </aside>
 
-  <!-- ── Stats Strip ─────────────────────────────────────────────────────── -->
-  <section class="stat-strip" aria-label="System statistics">
+  <!-- ── Main Content ───────────────────────────────────────────────────── -->
+  <main class="main-content">
 
-    <div class="stat-card">
-      <div class="stat-label">Total Nodes</div>
-      <div class="stat-value blue" id="stat-total-nodes">—</div>
-      <div class="stat-sub">in cluster</div>
-    </div>
-
-    <div class="stat-card">
-      <div class="stat-label">Online Nodes</div>
-      <div class="stat-value green" id="stat-online-nodes">—</div>
-      <div class="stat-sub">healthy &amp; serving</div>
-    </div>
-
-    <div class="stat-card">
-      <div class="stat-label">Availability</div>
-      <div class="stat-value violet" id="stat-availability">—</div>
-      <div class="stat-sub">node availability</div>
-    </div>
-
-    <div class="stat-card">
-      <div class="stat-label">Total Files</div>
-      <div class="stat-value blue" id="stat-total-files">—</div>
-      <div class="stat-sub">stored in DFS</div>
-    </div>
-
-    <div class="stat-card">
-      <div class="stat-label">Files at Risk</div>
-      <div class="stat-value amber" id="stat-at-risk">—</div>
-      <div class="stat-sub">under-replicated</div>
-    </div>
-
-    <div class="stat-card">
-      <div class="stat-label">Data Stored</div>
-      <div class="stat-value green" id="stat-bytes">—</div>
-      <div class="stat-sub">across all nodes</div>
-    </div>
-
-  </section>
-
-  <!-- ── Main Grid ───────────────────────────────────────────────────────── -->
-  <main class="main-grid">
-
-    <!-- ── Node Topology Panel ─────────────────────────────────────────── -->
-    <section class="panel" aria-labelledby="nodes-heading">
-      <div class="panel-header">
-        <div class="panel-title">
-          <span class="panel-icon">🌐</span>
-          <span id="nodes-heading">Cluster Nodes</span>
+    <!-- ── Top Bar ──────────────────────────────────────────────────────── -->
+    <header class="topbar">
+      <div class="topbar-left">
+        <h2 class="page-title" id="page-title">System Overview</h2>
+        <p class="page-subtitle" id="page-subtitle">Real-time cluster health and statistics</p>
+      </div>
+      <div class="topbar-right">
+        <div class="search-wrap">
+          <input type="text" class="search-input" id="file-search" placeholder="Search files…" aria-label="Search files" />
+          <span class="search-icon" aria-hidden="true">⌕</span>
         </div>
-        <div class="flex-row gap-8">
-          <button class="btn btn-primary btn-sm" id="btn-add-node">
-            ＋ Add Node
-          </button>
+        <button class="icon-btn" id="btn-refresh" title="Refresh data" aria-label="Refresh data">↺</button>
+      </div>
+    </header>
+
+    <!-- ── SECTION: Overview ─────────────────────────────────────────── -->
+    <section class="page-section active" id="section-overview" aria-label="Overview">
+
+      <!-- Stats Strip -->
+      <div class="stat-strip">
+        <div class="stat-card" id="sc-total-nodes">
+          <div class="stat-icon-wrap blue"><span>⬡</span></div>
+          <div class="stat-body">
+            <div class="stat-value" id="stat-total-nodes">—</div>
+            <div class="stat-label">Total Nodes</div>
+          </div>
+          <div class="stat-trend" id="st-nodes"></div>
+        </div>
+        <div class="stat-card" id="sc-online-nodes">
+          <div class="stat-icon-wrap green"><span>✓</span></div>
+          <div class="stat-body">
+            <div class="stat-value" id="stat-online-nodes">—</div>
+            <div class="stat-label">Online Nodes</div>
+          </div>
+        </div>
+        <div class="stat-card" id="sc-availability">
+          <div class="stat-icon-wrap violet"><span>◎</span></div>
+          <div class="stat-body">
+            <div class="stat-value" id="stat-availability">—</div>
+            <div class="stat-label">Availability</div>
+          </div>
+        </div>
+        <div class="stat-card" id="sc-total-files">
+          <div class="stat-icon-wrap cyan"><span>◫</span></div>
+          <div class="stat-body">
+            <div class="stat-value" id="stat-total-files">—</div>
+            <div class="stat-label">Total Files</div>
+          </div>
+        </div>
+        <div class="stat-card" id="sc-at-risk">
+          <div class="stat-icon-wrap amber"><span>⚠</span></div>
+          <div class="stat-body">
+            <div class="stat-value" id="stat-at-risk">—</div>
+            <div class="stat-label">At Risk</div>
+          </div>
+        </div>
+        <div class="stat-card" id="sc-bytes">
+          <div class="stat-icon-wrap indigo"><span>⬡</span></div>
+          <div class="stat-body">
+            <div class="stat-value" id="stat-bytes">—</div>
+            <div class="stat-label">Data Stored</div>
+          </div>
         </div>
       </div>
-      <div class="panel-body">
-        <div class="node-grid" id="node-grid">
-          <!-- Populated by JS -->
+
+      <!-- Node Cards -->
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title">
+            <span class="panel-icon">🌐</span>
+            <span>Cluster Nodes</span>
+          </div>
+          <div class="panel-actions">
+            <div class="rf-control">
+              <span class="rf-label">Replication Factor</span>
+              <div class="rf-stepper">
+                <button class="rf-btn" id="rf-minus" aria-label="Decrease replication factor">−</button>
+                <div class="rf-value" id="rf-display">2</div>
+                <button class="rf-btn" id="rf-plus" aria-label="Increase replication factor">＋</button>
+              </div>
+            </div>
+            <button class="btn btn-primary" id="btn-add-node">＋ Add Node</button>
+          </div>
         </div>
+        <div class="panel-body">
+          <div class="node-grid" id="node-grid">
+            <!-- Populated by JS -->
+          </div>
+        </div>
+      </div>
 
-        <div class="divider"></div>
-
-        <!-- Replication Factor Control -->
-        <div class="flex-row gap-12">
-          <span style="font-size:0.82rem; color:var(--text-secondary); font-weight:500;">
-            Replication Factor
-          </span>
-          <div class="rf-control">
-            <div class="rf-stepper">
-              <button class="rf-btn" id="rf-minus" aria-label="Decrease replication factor">−</button>
-              <div class="rf-value" id="rf-display">2</div>
-              <button class="rf-btn" id="rf-plus" aria-label="Increase replication factor">＋</button>
+      <!-- Fault Tolerance Cards -->
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title">
+            <span class="panel-icon">🛡️</span>
+            <span>Fault Tolerance & Security</span>
+          </div>
+          <span class="badge badge-green">Active</span>
+        </div>
+        <div class="panel-body">
+          <div class="ft-grid">
+            <div class="ft-card">
+              <div class="ft-icon">💓</div>
+              <div class="ft-title">Heartbeat Monitoring</div>
+              <div class="ft-desc">Nodes check in every 2s. Declared dead after 6s silence. Auto re-replication triggered.</div>
+            </div>
+            <div class="ft-card">
+              <div class="ft-icon">📋</div>
+              <div class="ft-title">Multi-Node Replication</div>
+              <div class="ft-desc">Each chunk is replicated to N nodes concurrently via ThreadPoolExecutor.</div>
+            </div>
+            <div class="ft-card">
+              <div class="ft-icon">🔐</div>
+              <div class="ft-title">AES-256-GCM Encryption</div>
+              <div class="ft-desc">Every chunk is encrypted at rest. Unique nonce per chunk. Zero plaintext on disk.</div>
+            </div>
+            <div class="ft-card">
+              <div class="ft-icon">📦</div>
+              <div class="ft-title">zlib Compression</div>
+              <div class="ft-desc">Chunks are compressed before encryption — saving storage and reducing I/O load.</div>
+            </div>
+            <div class="ft-card">
+              <div class="ft-icon">⚡</div>
+              <div class="ft-title">Parallel Processing</div>
+              <div class="ft-desc">Upload pipeline uses an 8-thread pool — all chunks processed and replicated in parallel.</div>
+            </div>
+            <div class="ft-card">
+              <div class="ft-icon">🌐</div>
+              <div class="ft-title">Dynamic Scaling</div>
+              <div class="ft-desc">Add or remove nodes at runtime. Cluster rebalances data automatically.</div>
             </div>
           </div>
-          <span class="text-muted">copies per chunk</span>
         </div>
-
       </div>
+
     </section>
 
-    <!-- ── Upload Panel ────────────────────────────────────────────────── -->
-    <section class="panel" aria-labelledby="upload-heading">
-      <div class="panel-header">
-        <div class="panel-title">
-          <span class="panel-icon">📤</span>
-          <span id="upload-heading">Upload Files</span>
+    <!-- ── SECTION: Topology ─────────────────────────────────────────── -->
+    <section class="page-section" id="section-topology" aria-label="Cluster Topology" aria-hidden="true">
+      <div class="panel topology-panel">
+        <div class="panel-header">
+          <div class="panel-title">
+            <span class="panel-icon">⛶</span>
+            <span>Live Cluster Topology</span>
+          </div>
+          <div class="panel-actions">
+            <span class="badge badge-blue">vis-network</span>
+            <button class="btn btn-ghost btn-sm" id="btn-topo-fit">⊡ Fit View</button>
+          </div>
         </div>
-        <span class="badge badge-violet">Auto-replicated</span>
-      </div>
-      <div class="panel-body">
-
-        <div class="upload-zone" id="upload-zone" role="button" tabindex="0"
-             aria-label="Upload zone — drag and drop files or click to browse">
-          <input type="file" id="file-input" multiple aria-label="File input" />
-          <span class="upload-icon">📁</span>
-          <h3>Drop files here</h3>
-          <p>or click to browse — any file type supported</p>
-        </div>
-
-        <div class="progress-container" id="upload-progress">
-          <div class="progress-bar-track">
-            <div class="progress-bar-fill" id="progress-fill"></div>
+        <div class="panel-body topo-body">
+          <div class="topo-legend">
+            <span class="legend-item"><span class="legend-dot green"></span>Online</span>
+            <span class="legend-item"><span class="legend-dot red"></span>Offline</span>
+            <span class="legend-item"><span class="legend-dot amber"></span>Recovering</span>
+            <span class="legend-item"><span class="legend-dot violet"></span>Master</span>
           </div>
-          <div class="progress-label" id="progress-label">Preparing…</div>
-        </div>
-
-        <div class="divider"></div>
-
-        <div style="display:flex; flex-direction:column; gap:10px;">
-
-          <div style="display:flex; align-items:center; gap:10px; padding:10px 14px;
-                      background:rgba(79,142,255,0.05); border:1px solid rgba(79,142,255,0.15);
-                      border-radius:var(--radius-sm); font-size:0.78rem;">
-            <span>🔐</span>
-            <span style="color:var(--text-secondary);">SHA-256 checksum computed and verified on every read</span>
-          </div>
-
-          <div style="display:flex; align-items:center; gap:10px; padding:10px 14px;
-                      background:rgba(16,185,129,0.05); border:1px solid rgba(16,185,129,0.15);
-                      border-radius:var(--radius-sm); font-size:0.78rem;">
-            <span>🔄</span>
-            <span style="color:var(--text-secondary);">Files auto-split into 512 KB chunks and distributed</span>
-          </div>
-
-          <div style="display:flex; align-items:center; gap:10px; padding:10px 14px;
-                      background:rgba(139,92,246,0.05); border:1px solid rgba(139,92,246,0.15);
-                      border-radius:var(--radius-sm); font-size:0.78rem;">
-            <span>⚡</span>
-            <span style="color:var(--text-secondary);">Automatic failover — reads from any healthy replica</span>
-          </div>
-
+          <div id="topology-graph" class="topology-graph" role="img" aria-label="Interactive cluster topology graph"></div>
         </div>
       </div>
     </section>
 
-    <!-- ── File System Panel ───────────────────────────────────────────── -->
-    <section class="panel full-width" aria-labelledby="files-heading">
-      <div class="panel-header">
-        <div class="panel-title">
-          <span class="panel-icon">📂</span>
-          <span id="files-heading">Distributed File Registry</span>
+    <!-- ── SECTION: Files ────────────────────────────────────────────── -->
+    <section class="page-section" id="section-files" aria-label="File Registry" aria-hidden="true">
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title">
+            <span class="panel-icon">📂</span>
+            <span>Distributed File Registry</span>
+          </div>
+          <span class="text-muted">Auto-updates every 2.5s</span>
         </div>
-        <span class="text-muted">Auto-updates every 2.5s</span>
-      </div>
-      <div class="panel-body" style="padding:0;">
-        <div class="file-table-wrapper">
-          <table class="file-table" aria-label="Distributed files list">
-            <thead>
-              <tr>
-                <th>File</th>
-                <th>Size</th>
-                <th>Chunks</th>
-                <th>Nodes (Replicas)</th>
-                <th>Uploaded</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody id="file-tbody">
-              <tr><td colspan="6">
-                <div class="empty-state">
-                  <div class="emoji">⏳</div>
-                  <p>Loading…</p>
-                </div>
-              </td></tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </section>
-
-    <!-- ── Event Log Panel ─────────────────────────────────────────────── -->
-    <section class="panel full-width" aria-labelledby="events-heading">
-      <div class="panel-header">
-        <div class="panel-title">
-          <span class="panel-icon">📡</span>
-          <span id="events-heading">System Event Log</span>
-        </div>
-        <button class="btn btn-ghost btn-sm" onclick="document.getElementById('event-log').innerHTML=''">
-          Clear
-        </button>
-      </div>
-      <div class="panel-body">
-        <div class="event-log" id="event-log" aria-live="polite" aria-label="System event log">
-          <div class="empty-state" style="padding:24px;">
-            <div class="emoji" style="font-size:1.8rem;">📻</div>
-            <p>Waiting for cluster events…</p>
+        <div class="panel-body" style="padding:0;">
+          <div class="file-table-wrapper">
+            <table class="file-table" aria-label="Distributed files list">
+              <thead>
+                <tr>
+                  <th>File</th>
+                  <th>Size</th>
+                  <th>Chunks</th>
+                  <th>Compression</th>
+                  <th>Nodes</th>
+                  <th>Uploaded</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="file-tbody">
+                <tr><td colspan="7">
+                  <div class="empty-state"><div class="empty-icon">⏳</div><p>Loading…</p></div>
+                </td></tr>
+              </tbody>
+            </table>
           </div>
         </div>
       </div>
     </section>
 
-    <!-- ── Fault Tolerance Info Panel ─────────────────────────────────── -->
-    <section class="panel full-width" aria-labelledby="ft-heading">
-      <div class="panel-header">
-        <div class="panel-title">
-          <span class="panel-icon">🛡️</span>
-          <span id="ft-heading">Fault Tolerance Mechanisms</span>
+    <!-- ── SECTION: Upload ───────────────────────────────────────────── -->
+    <section class="page-section" id="section-upload" aria-label="Upload Files" aria-hidden="true">
+      <div class="panel upload-panel">
+        <div class="panel-header">
+          <div class="panel-title">
+            <span class="panel-icon">📤</span>
+            <span>Upload to DFS</span>
+          </div>
+          <span class="badge badge-violet">Auto-replicated · Encrypted · Compressed</span>
         </div>
-        <span class="badge badge-blue">Active</span>
+        <div class="panel-body">
+          <div class="upload-zone" id="upload-zone" role="button" tabindex="0"
+               aria-label="Upload zone — drag and drop files or click to browse">
+            <input type="file" id="file-input" multiple aria-label="File input" />
+            <div class="upload-zone-inner">
+              <div class="upload-anim" id="upload-anim">
+                <svg width="64" height="64" viewBox="0 0 64 64" fill="none" aria-hidden="true">
+                  <circle cx="32" cy="32" r="30" stroke="url(#ug)" stroke-width="1.5" stroke-dasharray="6 4"/>
+                  <path d="M32 42V22M24 30l8-8 8 8" stroke="url(#ug)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+                  <defs>
+                    <linearGradient id="ug" x1="0" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse">
+                      <stop stop-color="#6366f1"/><stop offset="1" stop-color="#06b6d4"/>
+                    </linearGradient>
+                  </defs>
+                </svg>
+              </div>
+              <h3>Drop files here</h3>
+              <p>or <span class="upload-browse">click to browse</span> — any file type supported</p>
+              <p class="upload-hint">Files are split into 512 KB chunks, compressed with zlib, encrypted with AES-256-GCM, then replicated in parallel.</p>
+            </div>
+          </div>
+
+          <div class="progress-container hidden" id="upload-progress">
+            <div class="progress-header">
+              <span class="progress-filename" id="progress-filename">Uploading…</span>
+              <span class="progress-pct" id="progress-pct">0%</span>
+            </div>
+            <div class="progress-bar-track">
+              <div class="progress-bar-fill" id="progress-fill"></div>
+            </div>
+            <div class="progress-steps" id="progress-steps">
+              <span class="step active" id="step-chunk">⚙ Chunking</span>
+              <span class="step" id="step-compress">📦 Compressing</span>
+              <span class="step" id="step-encrypt">🔐 Encrypting</span>
+              <span class="step" id="step-replicate">🌐 Replicating</span>
+              <span class="step" id="step-done">✓ Done</span>
+            </div>
+          </div>
+
+          <div class="info-cards">
+            <div class="info-card blue">
+              <span>🔐</span>
+              <span>AES-256-GCM — Zero plaintext on disk. Unique nonce per chunk.</span>
+            </div>
+            <div class="info-card green">
+              <span>📦</span>
+              <span>zlib compression applied before encryption — better ratios, less storage.</span>
+            </div>
+            <div class="info-card violet">
+              <span>⚡</span>
+              <span>8-thread parallel replication — chunks distributed simultaneously.</span>
+            </div>
+          </div>
+        </div>
       </div>
-      <div class="panel-body">
-        <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap:16px;">
+    </section>
 
-          <div style="padding:16px; background:rgba(255,255,255,0.025); border:1px solid var(--border-subtle); border-radius:var(--radius-md);">
-            <div style="font-size:1.5rem; margin-bottom:8px;">💓</div>
-            <div style="font-weight:600; margin-bottom:4px; font-size:0.88rem;">Heartbeat Monitoring</div>
-            <div style="font-size:0.75rem; color:var(--text-muted);">Nodes report every 2s. Declared DEAD after 6s silence. Automatic re-replication triggered.</div>
+    <!-- ── SECTION: Events ───────────────────────────────────────────── -->
+    <section class="page-section" id="section-events" aria-label="Event Log" aria-hidden="true">
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title">
+            <span class="panel-icon">📡</span>
+            <span>System Event Log</span>
           </div>
-
-          <div style="padding:16px; background:rgba(255,255,255,0.025); border:1px solid var(--border-subtle); border-radius:var(--radius-md);">
-            <div style="font-size:1.5rem; margin-bottom:8px;">📋</div>
-            <div style="font-weight:600; margin-bottom:4px; font-size:0.88rem;">Multi-Node Replication</div>
-            <div style="font-size:0.75rem; color:var(--text-muted);">Each file chunk is replicated to N nodes (configurable). Maintains availability during failures.</div>
+          <button class="btn btn-ghost btn-sm" id="btn-clear-events">✕ Clear</button>
+        </div>
+        <div class="panel-body" style="padding:0;">
+          <div class="event-log" id="event-log" aria-live="polite" aria-label="System event log">
+            <div class="empty-state" style="padding:40px;">
+              <div class="empty-icon">📻</div>
+              <p>Waiting for cluster events…</p>
+            </div>
           </div>
-
-          <div style="padding:16px; background:rgba(255,255,255,0.025); border:1px solid var(--border-subtle); border-radius:var(--radius-md);">
-            <div style="font-size:1.5rem; margin-bottom:8px;">🔐</div>
-            <div style="font-weight:600; margin-bottom:4px; font-size:0.88rem;">SHA-256 Integrity</div>
-            <div style="font-size:0.75rem; color:var(--text-muted);">Every chunk checksum is verified on read. Corrupted data is detected and flagged immediately.</div>
-          </div>
-
-          <div style="padding:16px; background:rgba(255,255,255,0.025); border:1px solid var(--border-subtle); border-radius:var(--radius-md);">
-            <div style="font-size:1.5rem; margin-bottom:8px;">⚡</div>
-            <div style="font-weight:600; margin-bottom:4px; font-size:0.88rem;">Automatic Failover</div>
-            <div style="font-size:0.75rem; color:var(--text-muted);">Downloads automatically retry across all healthy replicas. Zero manual intervention required.</div>
-          </div>
-
-          <div style="padding:16px; background:rgba(255,255,255,0.025); border:1px solid var(--border-subtle); border-radius:var(--radius-md);">
-            <div style="font-size:1.5rem; margin-bottom:8px;">🔄</div>
-            <div style="font-weight:600; margin-bottom:4px; font-size:0.88rem;">Auto Re-replication</div>
-            <div style="font-size:0.75rem; color:var(--text-muted);">Under-replicated chunks are automatically redistributed to healthy nodes when a failure is detected.</div>
-          </div>
-
-          <div style="padding:16px; background:rgba(255,255,255,0.025); border:1px solid var(--border-subtle); border-radius:var(--radius-md);">
-            <div style="font-size:1.5rem; margin-bottom:8px;">🌐</div>
-            <div style="font-weight:600; margin-bottom:4px; font-size:0.88rem;">Dynamic Scaling</div>
-            <div style="font-size:0.75rem; color:var(--text-muted);">Add/remove nodes at runtime. New nodes join the cluster immediately and accept new replication targets.</div>
-          </div>
-
         </div>
       </div>
     </section>
@@ -285,7 +386,6 @@
   </main>
 </div>
 
-<script src="script.js"></script>
+<script src="script.js?v=2"></script>
 </body>
 </html>
-<!-- complete -->

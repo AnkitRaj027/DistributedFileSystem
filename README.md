@@ -7,7 +7,7 @@ A robust, fault-tolerant distributed file system implemented in Python. This sys
 - **Heartbeat Monitoring**: Constantly monitors the health of storage nodes.
 - **Automatic Recovery**: Automatically re-replicates data if a node fails.
 - **Premium Web Dashboard**: A modern, glassmorphism-inspired UI for real-time monitoring and system control.
-- **CLI Client**: A command-line interface for direct interaction with the system.
+- **REST API**: A fully-featured backend API handling file ingestion, node management, and distributed monitoring.
 
 ## Setup and Running
 

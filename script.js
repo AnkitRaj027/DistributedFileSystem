@@ -1,586 +1,568 @@
 /**
- * script.js — Distributed File System Dashboard
- * Handles all frontend logic, API calls, live polling, and animations
+ * DistributedFS v2.0 — Premium Client Logic
+ * Handles real-time topology, concurrent upload pipeline, and system monitoring.
  */
 
-"use strict";
+// ── State Management ─────────────────────────────────────────────────────────
 
-const API = "http://127.0.0.1:5000/api";
-let lastEventTs    = 0;
-let rfValue        = 2;
-let pollTimer      = null;
-let _pendingDelete = null;  // file_id currently awaiting confirmation
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-async function apiFetch(path, opts = {}) {
-  const res = await fetch(API + path, {
-    headers: { "Content-Type": "application/json", ...opts.headers },
-    ...opts,
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || `HTTP ${res.status}`);
-  }
-  return res.json();
-}
-
-function formatBytes(b) {
-  if (b === 0) return "0 B";
-  const k = 1024, sizes = ["B", "KB", "MB", "GB"];
-  const i = Math.floor(Math.log(b) / Math.log(k));
-  return parseFloat((b / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
-}
-
-function timeAgo(ts) {
-  const diff = Math.floor(Date.now() / 1000 - ts);
-  if (diff < 5)  return "just now";
-  if (diff < 60) return `${diff}s ago`;
-  return `${Math.floor(diff / 60)}m ago`;
-}
-
-function formatDate(ts) {
-  return new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-}
-
-// ── Toast notifications ───────────────────────────────────────────────────────
-
-function showToast(msg, type = "info", icon = "ℹ️") {
-  const container = document.getElementById("toast-container");
-  const el = document.createElement("div");
-  el.className = `toast ${type}`;
-  el.innerHTML = `<span>${icon}</span><span>${msg}</span>`;
-  container.appendChild(el);
-  setTimeout(() => {
-    el.classList.add("removing");
-    setTimeout(() => el.remove(), 300);
-  }, 3500);
-}
-
-// ── Stats Strip ───────────────────────────────────────────────────────────────
-
-async function refreshStats() {
-  try {
-    const s = await apiFetch("/system/stats");
-    document.getElementById("stat-total-nodes").textContent   = s.total_nodes;
-    document.getElementById("stat-online-nodes").textContent  = s.online_nodes;
-    document.getElementById("stat-total-files").textContent   = s.total_files;
-    document.getElementById("stat-at-risk").textContent       = s.files_at_risk;
-    document.getElementById("stat-availability").textContent  = s.availability_pct + "%";
-    document.getElementById("stat-bytes").textContent         = formatBytes(s.total_bytes_stored);
-    rfValue = s.replication_factor;
-    document.getElementById("rf-display").textContent = rfValue;
-  } catch {/* silently fail */}
-}
-
-// ── Node Panel ────────────────────────────────────────────────────────────────
-
-async function refreshNodes() {
-  try {
-    const nodes = await apiFetch("/nodes");
-    renderNodes(nodes);
-  } catch {/* silently fail */}
-}
-
-function renderNodes(nodes) {
-  const grid = document.getElementById("node-grid");
-  grid.innerHTML = "";
-
-  if (!nodes.length) {
-    grid.innerHTML = `<div class="empty-state"><div class="emoji">🌐</div><p>No nodes in cluster</p></div>`;
-    return;
-  }
-
-  nodes.forEach(n => {
-    const isOnline     = n.status === "online";
-    const isRecovering = n.status === "recovering";
-    const isOffline    = n.status === "offline";
-
-    const card = document.createElement("div");
-    card.className = `node-card ${n.status}`;
-    card.id = `node-card-${n.node_id}`;
-
-    const ringIcon = isOnline ? "🟢" : isRecovering ? "⚙️" : "🔴";
-    const usedPct  = n.used_pct.toFixed(1);
-    const lastHb   = timeAgo(n.last_heartbeat);
-
-    card.innerHTML = `
-      <div class="node-ring ${n.status}">${ringIcon}</div>
-      <div class="node-id">${n.node_id}</div>
-      <span class="node-status-badge ${n.status}">${n.status}</span>
-      <div class="node-meta">
-        <div>${n.chunks_stored} chunks</div>
-        <div>${formatBytes(n.bytes_stored)}</div>
-        <div style="color:var(--text-muted); font-size:0.63rem; margin-top:2px;">HB: ${lastHb}</div>
-      </div>
-      <div class="node-actions">
-        ${isOffline
-          ? `<button class="btn btn-success btn-sm" onclick="recoverNode('${n.node_id}')">Recover</button>
-             <button class="btn btn-danger btn-sm" id="rm-btn-${n.node_id}" onclick="removeNode('${n.node_id}', this)">Remove</button>`
-          : `<button class="btn btn-danger btn-sm" onclick="failNode('${n.node_id}')">Fail</button>`
-        }
-      </div>
-    `;
-    grid.appendChild(card);
-  });
-}
-
-async function failNode(nodeId) {
-  try {
-    await apiFetch(`/node/${nodeId}/fail`, { method: "POST" });
-    showToast(`Node ${nodeId} failed`, "error", "🔴");
-    refresh();
-  } catch (e) {
-    showToast(e.message, "error", "❌");
-  }
-}
-
-async function recoverNode(nodeId) {
-  try {
-    await apiFetch(`/node/${nodeId}/recover`, { method: "POST" });
-    showToast(`Node ${nodeId} recovering…`, "warning", "⚙️");
-    refresh();
-  } catch (e) {
-    showToast(e.message, "error", "❌");
-  }
-}
-
-async function addNode() {
-  try {
-    const res = await apiFetch("/node/add", { method: "POST" });
-    showToast(`Node ${res.node_id} added to cluster`, "success", "Added");
-    refresh();
-  } catch (e) {
-    showToast(e.message, "error", "Error");
-  }
-}
-
-let _pendingNodeRemove = null;
-
-function removeNode(nodeId, btnEl) {
-  // Two-click inline confirmation
-  if (_pendingNodeRemove === nodeId) {
-    _pendingNodeRemove = null;
-    clearTimeout(btnEl._confirmTimer);
-    _resetNodeRemoveBtn(btnEl);
-    _doRemoveNode(nodeId);
-    return;
-  }
-
-  if (_pendingNodeRemove) {
-    const prev = document.querySelector('[data-node-confirming="true"]');
-    if (prev) _resetNodeRemoveBtn(prev);
-  }
-
-  _pendingNodeRemove = nodeId;
-  btnEl.dataset.nodeConfirming = "true";
-  btnEl.textContent       = "Sure?";
-  btnEl.style.background  = "var(--accent-red)";
-  btnEl.style.color       = "#fff";
-  btnEl.style.borderColor = "var(--accent-red)";
-
-  // Pause polling so re-render doesn't orphan the button
-  clearInterval(pollTimer);
-
-  btnEl._confirmTimer = setTimeout(() => {
-    _pendingNodeRemove = null;
-    _resetNodeRemoveBtn(btnEl);
-    pollTimer = setInterval(refresh, 2500);
-  }, 4000);
-}
-
-function _resetNodeRemoveBtn(btn) {
-  btn.textContent       = "Remove";
-  btn.style.background  = "";
-  btn.style.color       = "";
-  btn.style.borderColor = "";
-  delete btn.dataset.nodeConfirming;
-}
-
-async function _doRemoveNode(nodeId) {
-  try {
-    const res = await apiFetch(`/node/${nodeId}`, { method: "DELETE" });
-    showToast(`${nodeId} permanently removed from cluster`, "info", "Removed");
-  } catch (e) {
-    showToast(e.message, "error", "Error");
-  } finally {
-    pollTimer = setInterval(refresh, 2500);
-    refresh();
-  }
-}
-
-// ── File Panel ────────────────────────────────────────────────────────────────
-
-async function refreshFiles() {
-  try {
-    const files = await apiFetch("/files");
-    renderFiles(files);
-  } catch {/* silently fail */}
-}
-
-function getFileIcon(name) {
-  const ext = name.split(".").pop().toLowerCase();
-  const map = {
-    pdf: "📄", txt: "📝", md: "📝",
-    png: "🖼️", jpg: "🖼️", jpeg: "🖼️", gif: "🖼️", svg: "🖼️",
-    mp4: "🎬", mkv: "🎬", avi: "🎬",
-    mp3: "🎵", wav: "🎵",
-    zip: "🗜️", tar: "🗜️", gz: "🗜️",
-    py: "🐍", js: "📦", html: "🌐", css: "🎨",
-    json: "📋", csv: "📊", xlsx: "📊",
-  };
-  return map[ext] || "📁";
-}
-
-function renderFiles(files) {
-  const tbody = document.getElementById("file-tbody");
-  tbody.innerHTML = "";
-
-  if (!files.length) {
-    tbody.innerHTML = `
-      <tr><td colspan="6">
-        <div class="empty-state">
-          <div class="emoji">📭</div>
-          <p>No files uploaded yet</p>
-        </div>
-      </td></tr>`;
-    return;
-  }
-
-  files.forEach(f => {
-    // Collect unique node IDs across all chunks
-    const nodeSet = new Set();
-    (f.chunks || []).forEach(c => c.node_ids.forEach(n => nodeSet.add(n)));
-
-    const nodes = await_nodes_cached();
-    const nodeStatusMap = {};
-    nodes.forEach(n => nodeStatusMap[n.node_id] = n.status);
-
-    const replicas = [...nodeSet].map(nid => {
-      const alive = nodeStatusMap[nid] === "online";
-      return `<span class="replica-pill ${alive ? '' : 'dead'}" title="${alive ? 'Online' : 'Offline'}">${nid}</span>`;
-    }).join("");
-
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td>
-        <div class="file-name-cell">
-          <span class="file-icon">${getFileIcon(f.name)}</span>
-          <div>
-            <div class="file-name" title="${f.name}">${f.name}</div>
-            <div class="file-id-mono">${f.file_id.slice(0, 8)}…</div>
-          </div>
-        </div>
-      </td>
-      <td>${formatBytes(f.size)}</td>
-      <td><span class="badge badge-blue">${f.num_chunks}</span></td>
-      <td><div class="replica-pills">${replicas}</div></td>
-      <td>${formatDate(f.upload_time)}</td>
-      <td>
-        <div class="flex-row gap-8">
-          <button class="btn btn-ghost btn-sm" onclick="downloadFile('${f.file_id}', '${f.name}')" title="Download">&#11015;</button>
-          <button class="btn btn-ghost btn-sm" onclick="checkIntegrity('${f.file_id}')" title="Verify integrity">Verify</button>
-          <button class="btn btn-danger btn-sm" onclick="deleteFile('${f.file_id}', '${f.name}', this)" title="Click to delete (click again to confirm)">Delete</button>
-        </div>
-      </td>
-    `;
-    tbody.appendChild(tr);
-  });
-}
-
-// Cache nodes for replica rendering
-let _nodeCacheTs = 0;
-let _nodeCache   = [];
-
-function await_nodes_cached() {
-  // Use cached version (refreshed in render cycle)
-  return _nodeCache;
-}
-
-async function refreshNodeCache() {
-  const data = await apiFetch("/nodes").catch(() => []);
-  _nodeCache = data;
-  _nodeCacheTs = Date.now();
-}
-
-async function downloadFile(fileId, name) {
-  try {
-    const res = await fetch(`${API}/download/${fileId}`);
-    if (!res.ok) {
-      const j = await res.json();
-      throw new Error(j.error);
-    }
-    const blob = await res.blob();
-    const url  = URL.createObjectURL(blob);
-    const a    = document.createElement("a");
-    a.href = url; a.download = name;
-    a.click();
-    URL.revokeObjectURL(url);
-    showToast(`Downloaded "${name}"`, "success", "⬇️");
-  } catch (e) {
-    showToast(e.message, "error", "❌");
-  }
-}
-
-function deleteFile(fileId, name, btnEl) {
-  // Two-click inline confirmation — avoids browser confirm() suppression issues
-  if (_pendingDelete === fileId) {
-    // Second click: confirmed — perform deletion
-    _pendingDelete = null;
-    clearTimeout(btnEl._confirmTimer);
-    _resetDeleteBtn(btnEl, name);
-    _doDelete(fileId, name);
-    return;
-  }
-
-  // First click: ask for confirmation via button state
-  if (_pendingDelete && _pendingDelete !== fileId) {
-    // Cancel any other pending confirm
-    const prev = document.querySelector('[data-confirming="true"]');
-    if (prev) _resetDeleteBtn(prev, prev.dataset.origName);
-  }
-
-  _pendingDelete = fileId;
-  btnEl.dataset.confirming = "true";
-  btnEl.dataset.origName   = name;
-  btnEl.textContent        = "Sure?";
-  btnEl.style.background   = "var(--accent-red)";
-  btnEl.style.color        = "#fff";
-  btnEl.style.borderColor  = "var(--accent-red)";
-
-  // Pause polling so the table doesn't re-render and orphan the button
-  clearInterval(pollTimer);
-
-  // Auto-cancel after 4 seconds
-  btnEl._confirmTimer = setTimeout(() => {
-    _pendingDelete = null;
-    _resetDeleteBtn(btnEl, name);
-    // Resume polling
-    pollTimer = setInterval(refresh, 2500);
-  }, 4000);
-}
-
-function _resetDeleteBtn(btn, name) {
-  btn.textContent = "Delete";
-  btn.style.background  = "";
-  btn.style.color       = "";
-  btn.style.borderColor = "";
-  delete btn.dataset.confirming;
-}
-
-async function _doDelete(fileId, name) {
-  try {
-    await apiFetch(`/delete/${fileId}`, { method: "DELETE" });
-    showToast(`Deleted "${name}"`, "info", "Deleted");
-  } catch (e) {
-    showToast(e.message, "error", "Error");
-  } finally {
-    // Always resume polling
-    pollTimer = setInterval(refresh, 2500);
-    refresh();
-  }
-}
-
-async function checkIntegrity(fileId) {
-  try {
-    const res = await apiFetch(`/integrity/${fileId}`);
-    let allOk = true;
-    res.chunks.forEach(c => c.replicas.forEach(r => { if (!r.valid) allOk = false; }));
-    if (allOk) {
-      showToast("✅ All chunks verified — integrity OK", "success", "🔐");
-    } else {
-      showToast("⚠️ Integrity issues detected! Check console.", "error", "⚠️");
-      console.warn("Integrity scan:", JSON.stringify(res, null, 2));
-    }
-  } catch (e) {
-    showToast(e.message, "error", "❌");
-  }
-}
-
-// ── Upload ────────────────────────────────────────────────────────────────────
-
-function initUpload() {
-  const zone    = document.getElementById("upload-zone");
-  const input   = document.getElementById("file-input");
-  const progress= document.getElementById("upload-progress");
-  const bar     = document.getElementById("progress-fill");
-  const label   = document.getElementById("progress-label");
-
-  zone.addEventListener("dragover",  e => { e.preventDefault(); zone.classList.add("drag-over"); });
-  zone.addEventListener("dragleave", () => zone.classList.remove("drag-over"));
-  zone.addEventListener("drop", e => {
-    e.preventDefault();
-    zone.classList.remove("drag-over");
-    const files = e.dataTransfer.files;
-    if (files.length) uploadFiles(files);
-  });
-
-  input.addEventListener("change", () => {
-    if (input.files.length) uploadFiles(input.files);
-  });
-
-  async function uploadFiles(fileList) {
-    for (const file of fileList) {
-      progress.classList.add("visible");
-      bar.style.width = "0%";
-      label.textContent = `Uploading ${file.name}…`;
-
-      // Fake progress animation for UX
-      let pct = 0;
-      const ticker = setInterval(() => {
-        pct = Math.min(pct + Math.random() * 12, 88);
-        bar.style.width = pct + "%";
-      }, 120);
-
-      try {
-        const form = new FormData();
-        form.append("file", file);
-        const res = await fetch(`${API}/upload`, { method: "POST", body: form });
-        const j   = await res.json();
-        clearInterval(ticker);
-
-        if (!res.ok) throw new Error(j.error);
-
-        bar.style.width = "100%";
-        label.textContent = `✅ Uploaded: ${file.name} (${j.num_chunks} chunks)`;
-        showToast(`"${file.name}" uploaded — ${j.num_chunks} chunk(s)`, "success", "📦");
-        setTimeout(() => { progress.classList.remove("visible"); }, 1800);
-        refresh();
-      } catch (e) {
-        clearInterval(ticker);
-        bar.style.width = "100%";
-        bar.style.background = "var(--accent-red)";
-        label.textContent = `❌ Error: ${e.message}`;
-        showToast(e.message, "error", "❌");
-        setTimeout(() => {
-          progress.classList.remove("visible");
-          bar.style.background = "";
-        }, 2500);
-      }
-
-      input.value = "";
-    }
-  }
-}
-
-// ── Event Log ─────────────────────────────────────────────────────────────────
-
-const EVENT_ICONS = {
-  upload:           "Upload",
-  download:         "Download",
-  node_failure:     "Failure",
-  node_recovery:    "Recovery",
-  node_add:         "Added",
-  node_delete:      "Removed",
-  replication:      "Replicated",
-  replication_fail: "Rep.Fail",
-  delete:           "Deleted",
+const state = {
+    nodes: [],
+    files: [],
+    events: [],
+    stats: {},
+    lastEventTs: 0,
+    activeSection: 'overview',
+    network: null, // vis.js instance
+    nodesDataset: null,
+    edgesDataset: null,
+    isRefreshing: false
 };
 
-async function refreshEvents() {
-  try {
-    const events = await apiFetch(`/events?since=${lastEventTs}`);
-    if (!events.length) return;
+const API_BASE = '/api';
+const REFRESH_INTERVAL = 2500;
 
-    const log = document.getElementById("event-log");
-    const wasAtBottom = log.scrollHeight - log.scrollTop <= log.clientHeight + 40;
+// ── Initialization ───────────────────────────────────────────────────────────
 
-    events.forEach(ev => {
-      lastEventTs = Math.max(lastEventTs, ev.ts);
-      const el = document.createElement("div");
-      el.className = `event-entry ${ev.type}`;
-      const icon = EVENT_ICONS[ev.type] || "ℹ️";
-      el.innerHTML = `
-        <span class="event-icon">${icon}</span>
-        <div class="event-body">
-          <div class="event-msg">${ev.message}</div>
-          <div class="event-time">${formatDate(ev.ts)}</div>
-        </div>
-      `;
-      log.appendChild(el);
+document.addEventListener('DOMContentLoaded', () => {
+    initNavigation();
+    initUploadZone();
+    initTopology();
+    startRefreshCycle();
+
+    // Global listeners
+    document.getElementById('btn-refresh').addEventListener('click', manualRefresh);
+    document.getElementById('btn-add-node').addEventListener('click', addNode);
+    document.getElementById('rf-minus').addEventListener('click', () => updateRF(-1));
+    document.getElementById('rf-plus').addEventListener('click', () => updateRF(1));
+    document.getElementById('file-search').addEventListener('input', handleSearch);
+    document.getElementById('btn-clear-events').addEventListener('click', clearEvents);
+    document.getElementById('modal-close').addEventListener('click', closeModal);
+    document.getElementById('btn-topo-fit').addEventListener('click', () => state.network.fit({ animation: true }));
+});
+
+// ── Navigation ───────────────────────────────────────────────────────────────
+
+function initNavigation() {
+    const navItems = document.querySelectorAll('.nav-item');
+    navItems.forEach(item => {
+        item.addEventListener('click', (e) => {
+            e.preventDefault();
+            const section = item.getAttribute('data-section');
+            switchSection(section);
+        });
+    });
+}
+
+function switchSection(sectionId) {
+    state.activeSection = sectionId;
+    
+    // Update Sidebar
+    document.querySelectorAll('.nav-item').forEach(el => {
+        el.classList.toggle('active', el.getAttribute('data-section') === sectionId);
     });
 
-    if (wasAtBottom) log.scrollTop = log.scrollHeight;
-  } catch {/* silently fail */}
+    // Update Content
+    document.querySelectorAll('.page-section').forEach(el => {
+        el.classList.toggle('active', el.id === `section-${sectionId}`);
+    });
+
+    // Update Header
+    const titles = {
+        overview: ['System Overview', 'Real-time cluster health and statistics'],
+        topology: ['Cluster Topology', 'Interactive node & data distribution graph'],
+        files: ['File Registry', 'Manage distributed objects and replicas'],
+        upload: ['Upload Center', 'Secure parallel ingestion pipeline'],
+        events: ['Event Streaming', 'Live system activity and audit log']
+    };
+
+    const [title, subtitle] = titles[sectionId] || ['DistributedFS', ''];
+    document.getElementById('page-title').innerText = title;
+    document.getElementById('page-subtitle').innerText = subtitle;
+
+    if (sectionId === 'topology' && state.network) {
+        setTimeout(() => {
+            const container = document.getElementById('topology-graph');
+            if (container) {
+                state.network.setSize(container.offsetWidth + 'px', container.offsetHeight + 'px');
+                state.network.redraw();
+                state.network.fit({ animation: false });
+            }
+        }, 150);
+    }
 }
 
-// ── Replication Factor ────────────────────────────────────────────────────────
+// ── Topology Graph (vis.js) ─────────────────────────────────────────────────
 
-function initRFControl() {
-  document.getElementById("rf-minus").addEventListener("click", async () => {
-    if (rfValue <= 1) return;
-    rfValue--;
-    document.getElementById("rf-display").textContent = rfValue;
-    await apiFetch("/system/replication-factor", {
-      method: "POST",
-      body: JSON.stringify({ factor: rfValue }),
-    }).catch(() => {});
-    showToast(`Replication factor set to ${rfValue}`, "info", "🔢");
-  });
+function initTopology() {
+    state.nodesDataset = new vis.DataSet([]);
+    state.edgesDataset = new vis.DataSet([]);
 
-  document.getElementById("rf-plus").addEventListener("click", async () => {
-    rfValue++;
-    document.getElementById("rf-display").textContent = rfValue;
-    await apiFetch("/system/replication-factor", {
-      method: "POST",
-      body: JSON.stringify({ factor: rfValue }),
-    }).catch(() => {});
-    showToast(`Replication factor set to ${rfValue}`, "info", "🔢");
-  });
+    const container = document.getElementById('topology-graph');
+    const data = { nodes: state.nodesDataset, edges: state.edgesDataset };
+    const options = {
+        nodes: {
+            shape: 'dot',
+            size: 25,
+            font: { color: '#94a3b8', size: 12, face: 'Inter' },
+            borderWidth: 2,
+            shadow: { enabled: true, color: 'rgba(0,0,0,0.5)', size: 10 }
+        },
+        edges: {
+            width: 2,
+            color: { color: '#334155', highlight: '#6366f1' },
+            smooth: { type: 'continuous' }
+        },
+        physics: {
+            forceAtlas2Based: { gravitationalConstant: -50, centralGravity: 0.01, springLength: 100, springConstant: 0.08 },
+            maxVelocity: 50,
+            solver: 'forceAtlas2Based',
+            timestep: 0.35,
+            stabilization: { iterations: 150 }
+        },
+        interaction: { hover: true, tooltipDelay: 200 }
+    };
+
+    state.network = new vis.Network(container, data, options);
 }
 
-// ── Decorative network lines ──────────────────────────────────────────────────
+function updateTopology(nodes) {
+    const nodesUpdate = [];
+    const edgesUpdate = [];
 
-function initNetworkLines() {
-  const container = document.getElementById("network-lines");
-  const count = 6;
-  for (let i = 0; i < count; i++) {
-    const el = document.createElement("div");
-    el.className = "net-line";
-    el.style.cssText = `
-      top: ${Math.random() * 100}%;
-      width: ${40 + Math.random() * 40}%;
-      animation-duration: ${6 + Math.random() * 10}s;
-      animation-delay: ${Math.random() * -12}s;
-      opacity: ${0.3 + Math.random() * 0.4};
+    // Master Node (Virtual)
+    if (!state.nodesDataset.get('master')) {
+        nodesUpdate.push({
+            id: 'master',
+            label: 'MASTER',
+            title: 'Master Coordinator',
+            color: { background: '#6366f1', border: '#818cf8' },
+            size: 35,
+            icon: { face: 'Inter', code: '\uf0e8', color: '#fff' }
+        });
+    }
+
+    nodes.forEach(node => {
+        let color = '#10b981'; // online
+        if (node.status === 'offline') color = '#ef4444';
+        if (node.status === 'recovering') color = '#f59e0b';
+
+        nodesUpdate.push({
+            id: node.node_id,
+            label: node.node_id,
+            title: `${node.node_id}\nStorage: ${formatBytes(node.bytes_stored)} / ${formatBytes(node.total_capacity)}\nStatus: ${node.status}`,
+            color: { background: color, border: 'rgba(255,255,255,0.1)' }
+        });
+
+        const edgeId = `m-${node.node_id}`;
+        if (!state.edgesDataset.get(edgeId)) {
+            edgesUpdate.push({ id: edgeId, from: 'master', to: node.node_id, dashes: node.status === 'offline' });
+        } else {
+            state.edgesDataset.update({ id: edgeId, dashes: node.status === 'offline' });
+        }
+    });
+
+    state.nodesDataset.update(nodesUpdate);
+    state.edgesDataset.update(edgesUpdate);
+
+    // Remove defunct nodes
+    const currentIds = nodes.map(n => n.node_id).concat(['master']);
+    state.nodesDataset.getIds().forEach(id => {
+        if (!currentIds.includes(id)) {
+            state.nodesDataset.remove(id);
+            state.edgesDataset.remove(`m-${id}`);
+        }
+    });
+}
+
+// ── Refresh Cycle ───────────────────────────────────────────────────────────
+
+async function manualRefresh() {
+    const btn = document.getElementById('btn-refresh');
+    btn.classList.add('rotating');
+    await refreshAll();
+    setTimeout(() => btn.classList.remove('rotating'), 500);
+    showToast('System data refreshed');
+}
+
+function startRefreshCycle() {
+    refreshAll();
+    setInterval(refreshAll, REFRESH_INTERVAL);
+}
+
+async function refreshAll() {
+    if (state.isRefreshing) return;
+    state.isRefreshing = true;
+
+    try {
+        const [nodes, files, stats, events] = await Promise.all([
+            fetch(`${API_BASE}/nodes`).then(r => r.json()),
+            fetch(`${API_BASE}/files`).then(r => r.json()),
+            fetch(`${API_BASE}/system/stats`).then(r => r.json()),
+            fetch(`${API_BASE}/events?since=${state.lastEventTs}`).then(r => r.json())
+        ]);
+
+        state.nodes = nodes;
+        state.files = files;
+        state.stats = stats;
+        
+        if (events.length > 0) {
+            state.events = [...events, ...state.events].slice(0, 200);
+            state.lastEventTs = events[0].ts;
+            updateEventLog(events);
+        }
+
+        updateUI();
+    } catch (err) {
+        console.error('Refresh failed:', err);
+    } finally {
+        state.isRefreshing = false;
+    }
+}
+
+// ── UI Updates ──────────────────────────────────────────────────────────────
+
+function updateUI() {
+    // Stats
+    document.getElementById('stat-total-nodes').innerText = state.stats.total_nodes;
+    document.getElementById('stat-online-nodes').innerText = state.stats.online_nodes;
+    document.getElementById('stat-availability').innerText = `${state.stats.availability_pct}%`;
+    document.getElementById('stat-total-files').innerText = state.stats.total_files;
+    document.getElementById('stat-at-risk').innerText = state.stats.files_at_risk;
+    document.getElementById('stat-bytes').innerText = formatBytes(state.stats.total_bytes_stored);
+    document.getElementById('rf-display').innerText = state.stats.replication_factor;
+
+    // Chips
+    document.getElementById('chip-encrypt').style.opacity = state.stats.encryption_enabled ? '1' : '0.3';
+    document.getElementById('chip-compress').style.opacity = state.stats.compression_enabled ? '1' : '0.3';
+
+    // Node Grid
+    renderNodeGrid();
+
+    // File Table
+    renderFileTable();
+
+    // Topology
+    updateTopology(state.nodes);
+}
+
+function renderNodeGrid() {
+    const grid = document.getElementById('node-grid');
+    grid.innerHTML = state.nodes.map(node => `
+        <div class="node-card">
+            <div class="node-header">
+                <span class="node-id">${node.node_id}</span>
+                <span class="status-badge status-${node.status}">${node.status}</span>
+            </div>
+            <div class="node-stats">
+                <div class="stat-item">
+                    <span class="stat-label">Chunks</span>
+                    <span class="stat-num">${node.chunks_stored}</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Storage</span>
+                    <span class="stat-num">${formatBytes(node.bytes_stored)}</span>
+                </div>
+            </div>
+            <div class="storage-bar-wrap">
+                <div class="storage-bar-label">
+                    <span>Utilization</span>
+                    <span>${node.used_pct}%</span>
+                </div>
+                <div class="storage-track">
+                    <div class="storage-fill" style="width: ${node.used_pct}%"></div>
+                </div>
+            </div>
+            <div class="node-actions">
+                ${node.status === 'online' 
+                    ? `<button class="btn btn-danger btn-sm" onclick="failNode('${node.node_id}')">Fail</button>` 
+                    : `<button class="btn btn-primary btn-sm" onclick="recoverNode('${node.node_id}')">Recover</button>`
+                }
+                <button class="btn btn-ghost btn-sm" onclick="deleteNode('${node.node_id}')" ${node.status === 'online' ? 'disabled' : ''}>Remove</button>
+            </div>
+        </div>
+    `).join('');
+}
+
+function renderFileTable() {
+    const tbody = document.getElementById('file-tbody');
+    const searchTerm = document.getElementById('file-search').value.toLowerCase();
+    
+    const filtered = state.files.filter(f => f.name.toLowerCase().includes(searchTerm));
+
+    if (filtered.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="7"><div class="empty-state">No files found</div></td></tr>';
+        return;
+    }
+
+    tbody.innerHTML = filtered.map(file => {
+        const nodes = [...new Set(file.chunks.flatMap(c => c.node_ids))];
+        return `
+            <tr>
+                <td>
+                    <div class="file-name-cell">
+                        <div class="file-icon">📄</div>
+                        <div class="file-info">
+                            <span class="file-name">${file.name}</span>
+                            <span class="file-id-sub">${file.file_id.slice(0, 8)}...</span>
+                        </div>
+                    </div>
+                </td>
+                <td>${formatBytes(file.size)}</td>
+                <td>${file.num_chunks}</td>
+                <td>
+                    <span class="badge ${file.chunks[0]?.compressed ? 'badge-blue' : ''}">
+                        ${file.chunks[0]?.compressed ? 'zlib Active' : 'None'}
+                    </span>
+                </td>
+                <td>
+                    <div class="node-badges">
+                        ${nodes.map(nid => `<span class="node-badge">${nid}</span>`).join('')}
+                    </div>
+                </td>
+                <td class="text-muted">${new Date(file.upload_time * 1000).toLocaleTimeString()}</td>
+                <td>
+                    <div style="display:flex; gap:8px;">
+                        <button class="icon-btn btn-sm" title="Download" onclick="downloadFile('${file.file_id}')">⬇</button>
+                        <button class="icon-btn btn-sm" title="Integrity Scan" onclick="verifyIntegrity('${file.file_id}')">🛡</button>
+                        <button class="icon-btn btn-sm" title="Delete" onclick="deleteFile('${file.file_id}')">✕</button>
+                    </div>
+                </td>
+            </tr>
+        `;
+    }).join('');
+}
+
+function updateEventLog(newEvents) {
+    const log = document.getElementById('event-log');
+    const badge = document.getElementById('nav-event-count');
+    
+    if (log.querySelector('.empty-state')) log.innerHTML = '';
+
+    const html = newEvents.map(ev => `
+        <div class="event-item">
+            <div class="event-time">${new Date(ev.ts * 1000).toLocaleTimeString([], {hour12:false})}</div>
+            <div class="event-content">
+                <div class="event-type type-${ev.type}">${ev.type.replace('_', ' ')}</div>
+                <div class="event-msg">${ev.message}</div>
+            </div>
+        </div>
+    `).join('');
+
+    log.insertAdjacentHTML('afterbegin', html);
+    badge.innerText = parseInt(badge.innerText || 0) + newEvents.length;
+}
+
+// ── File Operations ──────────────────────────────────────────────────────────
+
+function initUploadZone() {
+    const zone = document.getElementById('upload-zone');
+    const input = document.getElementById('file-input');
+
+    zone.addEventListener('dragover', (e) => { e.preventDefault(); zone.classList.add('dragover'); });
+    zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
+    zone.addEventListener('drop', (e) => {
+        e.preventDefault();
+        zone.classList.remove('dragover');
+        handleFiles(e.dataTransfer.files);
+    });
+    input.addEventListener('change', () => handleFiles(input.files));
+}
+
+async function handleFiles(files) {
+    if (files.length === 0) return;
+    
+    switchSection('upload');
+    const progress = document.getElementById('upload-progress');
+    progress.classList.remove('hidden');
+
+    for (const file of files) {
+        document.getElementById('progress-filename').innerText = `Uploading: ${file.name}`;
+        await uploadFile(file);
+    }
+
+    setTimeout(() => {
+        progress.classList.add('hidden');
+        resetUploadSteps();
+        manualRefresh();
+    }, 2000);
+}
+
+async function uploadFile(file) {
+    const steps = ['step-chunk', 'step-compress', 'step-encrypt', 'step-replicate', 'step-done'];
+    const fill = document.getElementById('progress-fill');
+    
+    const updateStep = (idx) => {
+        steps.forEach((s, i) => {
+            const el = document.getElementById(s);
+            el.classList.toggle('active', i === idx);
+        });
+        fill.style.width = `${(idx / (steps.length - 1)) * 100}%`;
+        document.getElementById('progress-pct').innerText = `${Math.round((idx / (steps.length - 1)) * 100)}%`;
+    };
+
+    try {
+        updateStep(0); // Chunking
+        await sleep(400);
+        updateStep(1); // Compressing
+        await sleep(300);
+        updateStep(2); // Encrypting
+        await sleep(300);
+        updateStep(3); // Replicating
+
+        const formData = new FormData();
+        formData.append('file', file);
+
+        const res = await fetch(`${API_BASE}/upload`, { method: 'POST', body: formData });
+        if (!res.ok) throw new Error(await res.text());
+
+        updateStep(4); // Done
+        showToast(`Successfully uploaded ${file.name}`, 'success');
+    } catch (err) {
+        showToast(`Upload failed: ${err.message}`, 'error');
+    }
+}
+
+function resetUploadSteps() {
+    const steps = ['step-chunk', 'step-compress', 'step-encrypt', 'step-replicate', 'step-done'];
+    steps.forEach(s => document.getElementById(s).classList.remove('active'));
+    document.getElementById('progress-fill').style.width = '0%';
+}
+
+async function downloadFile(id) {
+    window.location.href = `${API_BASE}/download/${id}`;
+    showToast('Download started');
+}
+
+async function deleteFile(id) {
+    if (!confirm('Permanently delete this file?')) return;
+    const res = await fetch(`${API_BASE}/delete/${id}`, { method: 'DELETE' });
+    if (res.ok) {
+        showToast('File deleted');
+        manualRefresh();
+    }
+}
+
+async function verifyIntegrity(id) {
+    showToast('Starting integrity scan...');
+    const res = await fetch(`${API_BASE}/integrity/${id}`);
+    const data = await res.json();
+    
+    const body = document.getElementById('modal-body');
+    body.innerHTML = `
+        <div class="integrity-report">
+            <h4>File ID: ${data.file_id}</h4>
+            <div class="chunk-list" style="margin-top:20px;">
+                ${data.chunks.map(c => `
+                    <div style="margin-bottom:15px; padding:12px; background:rgba(255,255,255,0.03); border-radius:8px;">
+                        <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
+                            <strong>Chunk #${c.index}</strong>
+                            <code style="font-size:0.7rem;">${c.chunk_id}</code>
+                        </div>
+                        <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+                            ${c.replicas.map(r => `
+                                <div style="font-size:0.8rem; color:${r.valid ? 'var(--status-green)' : 'var(--status-red)'}">
+                                    ${r.node}: ${r.valid ? '✓ Valid' : '✕ ' + r.msg}
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                `).join('')}
+            </div>
+        </div>
     `;
-    container.appendChild(el);
-  }
+    openModal('Integrity Report');
 }
 
-// ── Polling loop ──────────────────────────────────────────────────────────────
+// ── Node Actions ────────────────────────────────────────────────────────────
 
-async function refresh() {
-  await refreshNodeCache();
-  await Promise.all([
-    refreshStats(),
-    refreshNodes(),
-    refreshFiles(),
-    refreshEvents(),
-  ]);
+async function addNode() {
+    const res = await fetch(`${API_BASE}/node/add`, { method: 'POST' });
+    if (res.ok) {
+        showToast('New storage node added');
+        manualRefresh();
+    }
 }
 
-function startPolling() {
-  refresh();
-  pollTimer = setInterval(refresh, 2500);
+async function failNode(id) {
+    const res = await fetch(`${API_BASE}/node/${id}/fail`, { method: 'POST' });
+    if (res.ok) {
+        showToast(`Node ${id} simulated failure`);
+        manualRefresh();
+    }
 }
 
-// Resume polling whenever page regains focus (extra safety net)
-document.addEventListener("visibilitychange", () => {
-  if (!document.hidden && !pollTimer) {
-    pollTimer = setInterval(refresh, 2500);
-  }
-});
+async function recoverNode(id) {
+    const res = await fetch(`${API_BASE}/node/${id}/recover`, { method: 'POST' });
+    if (res.ok) {
+        showToast(`Node ${id} recovery started`);
+        manualRefresh();
+    }
+}
 
-// ── Init ──────────────────────────────────────────────────────────────────────
+async function deleteNode(id) {
+    const res = await fetch(`${API_BASE}/node/${id}`, { method: 'DELETE' });
+    const data = await res.json();
+    if (res.ok) {
+        showToast(data.message || `Node ${id} removed`);
+        manualRefresh();
+    } else {
+        showToast(data.error, 'error');
+    }
+}
 
-document.addEventListener("DOMContentLoaded", () => {
-  initNetworkLines();
-  initUpload();
-  initRFControl();
+async function updateRF(delta) {
+    const current = state.stats.replication_factor;
+    const next = Math.max(1, current + delta);
+    if (next === current) return;
 
-  document.getElementById("btn-add-node").addEventListener("click", addNode);
-  document.getElementById("btn-refresh").addEventListener("click", refresh);
+    const res = await fetch(`${API_BASE}/system/replication-factor`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ factor: next })
+    });
+    if (res.ok) {
+        showToast(`Replication factor updated to ${next}`);
+        manualRefresh();
+    }
+}
 
-  startPolling();
-});
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+function formatBytes(bytes, decimals = 2) {
+    if (!+bytes) return '0 Bytes';
+    const k = 1024;
+    const dm = decimals < 0 ? 0 : decimals;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
+}
+
+function handleSearch() {
+    renderFileTable();
+}
+
+function clearEvents() {
+    document.getElementById('event-log').innerHTML = '<div class="empty-state" style="padding:40px;"><div class="empty-icon">📻</div><p>Waiting for cluster events…</p></div>';
+    document.getElementById('nav-event-count').innerText = '0';
+    state.events = [];
+}
+
+function showToast(msg, type = 'success') {
+    const container = document.getElementById('toast-container');
+    const toast = document.createElement('div');
+    toast.className = `toast toast-${type}`;
+    toast.innerHTML = `<span>${type === 'success' ? '✓' : '✕'}</span> ${msg}`;
+    container.appendChild(toast);
+    setTimeout(() => toast.remove(), 4000);
+}
+
+function openModal(title) {
+    document.getElementById('modal-title').innerText = title;
+    document.getElementById('modal-overlay').style.display = 'flex';
+}
+
+function closeModal() {
+    document.getElementById('modal-overlay').style.display = 'none';
+}
+
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }

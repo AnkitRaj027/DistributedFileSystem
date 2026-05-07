@@ -1,22 +1,32 @@
 """
-dfs_core.py — Core Distributed File System Engine
-Handles: nodes, chunking, replication, heartbeat tracking, integrity checks
+dfs_core.py — Core Distributed File System Engine (v2 — Next Level)
+Features: zlib compression, AES-256 encryption at rest, concurrent replication
 """
 
 import os
 import uuid
 import json
 import time
+import zlib
 import hashlib
 import threading
-from dataclasses import dataclass, field, asdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from enum import Enum
+
+# Optional AES encryption via `cryptography` package
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    import secrets
+    ENCRYPTION_ENABLED = True
+except ImportError:
+    ENCRYPTION_ENABLED = False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Enums & Constants
 # ─────────────────────────────────────────────────────────────────────────────
-#node statusS
+
 class NodeStatus(str, Enum):
     ONLINE     = "online"
     OFFLINE    = "offline"
@@ -26,20 +36,64 @@ CHUNK_SIZE         = 512 * 1024   # 512 KB per chunk
 HEARTBEAT_INTERVAL = 2            # seconds between heartbeats
 HEARTBEAT_TIMEOUT  = 6            # seconds before node is declared dead
 DATA_DIR           = "data"       # root storage directory
+MAX_WORKERS        = 8            # thread pool size for parallel ops
+
+# Derive a stable 32-byte AES key from a master secret (in production, load from env/vault)
+_MASTER_SECRET = b"dfs-master-secret-key-v2-2026!!"  # 32 bytes
+_AES_KEY = hashlib.sha256(_MASTER_SECRET).digest()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Encryption helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def encrypt_chunk(data: bytes) -> bytes:
+    """AES-256-GCM encrypt. Returns nonce(12) + ciphertext."""
+    if not ENCRYPTION_ENABLED:
+        return data
+    aesgcm = AESGCM(_AES_KEY)
+    nonce = secrets.token_bytes(12)
+    ct = aesgcm.encrypt(nonce, data, None)
+    return nonce + ct
+
+
+def decrypt_chunk(data: bytes) -> bytes:
+    """AES-256-GCM decrypt. Expects nonce(12) + ciphertext."""
+    if not ENCRYPTION_ENABLED:
+        return data
+    aesgcm = AESGCM(_AES_KEY)
+    nonce, ct = data[:12], data[12:]
+    return aesgcm.decrypt(nonce, ct, None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Compression helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compress_chunk(data: bytes) -> bytes:
+    """zlib compress at level 6 for a good speed/ratio balance."""
+    return zlib.compress(data, level=6)
+
+
+def decompress_chunk(data: bytes) -> bytes:
+    return zlib.decompress(data)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data Classes
 # ─────────────────────────────────────────────────────────────────────────────
-#data classes
+
 @dataclass
 class ChunkMeta:
-    chunk_id:  str
-    file_id:   str
-    index:     int
-    size:      int
-    checksum:  str        # SHA-256 hex digest
-    node_ids:  List[str]  # nodes that hold this chunk
+    chunk_id:       str
+    file_id:        str
+    index:          int
+    size:           int           # original (pre-compression) size
+    stored_size:    int           # size on disk (post-compress/encrypt)
+    checksum:       str           # SHA-256 of original data
+    node_ids:       List[str]
+    compressed:     bool = True
+    encrypted:      bool = True
 
 
 @dataclass
@@ -50,18 +104,18 @@ class FileMeta:
     upload_time: float
     num_chunks:  int
     chunks:      List[ChunkMeta] = field(default_factory=list)
-    checksum:    str = ""         # whole-file checksum
+    checksum:    str = ""
 
 
 @dataclass
 class NodeInfo:
-    node_id:         str
-    status:          NodeStatus
-    storage_path:    str
-    last_heartbeat:  float
-    chunks_stored:   int  = 0
-    bytes_stored:    int  = 0
-    total_capacity:  int  = 5 * 1024 * 1024 * 1024  # 5 GB simulated
+    node_id:        str
+    status:         NodeStatus
+    storage_path:   str
+    last_heartbeat: float
+    chunks_stored:  int = 0
+    bytes_stored:   int = 0
+    total_capacity: int = 5 * 1024 * 1024 * 1024  # 5 GB simulated
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -69,7 +123,6 @@ class NodeInfo:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def sha256_of(data: bytes) -> str:
-    """Compute and return the SHA-256 hexadecimal checksum of the given bytes."""
     return hashlib.sha256(data).hexdigest()
 
 
@@ -78,9 +131,19 @@ def chunk_file(data: bytes) -> List[Tuple[int, bytes]]:
     chunks = []
     for i in range(0, len(data), CHUNK_SIZE):
         chunks.append((i // CHUNK_SIZE, data[i: i + CHUNK_SIZE]))
-    if not chunks:                 # empty file → one empty chunk
+    if not chunks:
         chunks.append((0, b""))
     return chunks
+
+
+def prepare_chunk(raw: bytes) -> bytes:
+    """Compress then encrypt a raw chunk for storage."""
+    return encrypt_chunk(compress_chunk(raw))
+
+
+def recover_chunk(stored: bytes) -> bytes:
+    """Decrypt then decompress a stored chunk."""
+    return decompress_chunk(decrypt_chunk(stored))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -94,14 +157,10 @@ class NodeManager:
         self._lock  = threading.RLock()
         self._nodes: Dict[str, NodeInfo] = {}
 
-    # ── internal ──────────────────────────────────────────────────────────────
-
     def _node_dir(self, node_id: str) -> str:
         path = os.path.join(DATA_DIR, node_id)
         os.makedirs(path, exist_ok=True)
         return path
-
-    # ── public ────────────────────────────────────────────────────────────────
 
     def add_node(self, node_id: Optional[str] = None) -> NodeInfo:
         with self._lock:
@@ -150,7 +209,6 @@ class NodeManager:
                 self._nodes[node_id].last_heartbeat = time.time()
 
     def check_heartbeats(self) -> List[str]:
-        """Return list of node_ids that just timed out."""
         dead = []
         now  = time.time()
         with self._lock:
@@ -160,7 +218,6 @@ class NodeManager:
                         info.status = NodeStatus.OFFLINE
                         dead.append(info.node_id)
                 elif info.status == NodeStatus.RECOVERING:
-                    # After a brief recovery window, bring back online
                     if now - info.last_heartbeat > 2:
                         info.status = NodeStatus.ONLINE
         return dead
@@ -194,29 +251,33 @@ class NodeManager:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ChunkStore:
-    """Low-level disk read/write for chunks."""
+    """Low-level disk read/write for chunks (stored compressed+encrypted)."""
 
     @staticmethod
     def _chunk_path(node: NodeInfo, chunk_id: str) -> str:
         return os.path.join(node.storage_path, chunk_id + ".chunk")
 
     @classmethod
-    def write(cls, node: NodeInfo, chunk_id: str, data: bytes) -> bool:
+    def write(cls, node: NodeInfo, chunk_id: str, raw_data: bytes) -> Tuple[bool, int]:
+        """Compress + encrypt then write. Returns (success, stored_size)."""
         try:
+            payload = prepare_chunk(raw_data)
             path = cls._chunk_path(node, chunk_id)
             with open(path, "wb") as f:
-                f.write(data)
-            return True
-        except OSError:
-            return False
+                f.write(payload)
+            return True, len(payload)
+        except Exception:
+            return False, 0
 
     @classmethod
     def read(cls, node: NodeInfo, chunk_id: str) -> Optional[bytes]:
+        """Read, decrypt, decompress. Returns original bytes or None."""
         try:
             path = cls._chunk_path(node, chunk_id)
             with open(path, "rb") as f:
-                return f.read()
-        except OSError:
+                payload = f.read()
+            return recover_chunk(payload)
+        except Exception:
             return None
 
     @classmethod
@@ -235,20 +296,20 @@ class ChunkStore:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Replication Manager
+# Replication Manager  (concurrent)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ReplicationManager:
-    """Selects target nodes for chunk placement using round-robin + health."""
+    """Selects target nodes using round-robin + replicates chunks concurrently."""
 
     def __init__(self, node_manager: NodeManager, replication_factor: int = 2):
         self.node_manager       = node_manager
         self.replication_factor = replication_factor
         self._rr_index          = 0
         self._lock              = threading.Lock()
+        self._executor          = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="dfs-rep")
 
     def select_nodes(self, count: int) -> List[NodeInfo]:
-        """Pick `count` online nodes, round-robin style."""
         online = self.node_manager.online_nodes()
         if not online:
             return []
@@ -260,18 +321,29 @@ class ReplicationManager:
                 self._rr_index += 1
         return selected
 
-    def replicate_chunk(
-        self, chunk_id: str, data: bytes, node_manager: NodeManager
-    ) -> List[str]:
-        """Write chunk to `replication_factor` nodes. Returns list of node_ids that succeeded."""
-        targets    = self.select_nodes(self.replication_factor)
+    def _write_to_node(self, node: NodeInfo, chunk_id: str, data: bytes):
+        ok, stored_size = ChunkStore.write(node, chunk_id, data)
+        if ok:
+            self.node_manager.update_node_stats(node.node_id, 1, stored_size)
+            return node.node_id
+        return None
+
+    def replicate_chunk(self, chunk_id: str, data: bytes, node_manager: NodeManager) -> Tuple[List[str], int]:
+        """Write chunk to replication_factor nodes concurrently.
+        Returns (list of node_ids that succeeded, stored_size)."""
+        targets = self.select_nodes(self.replication_factor)
         successful = []
-        for node in targets:
-            ok = ChunkStore.write(node, chunk_id, data)
-            if ok:
-                node_manager.update_node_stats(node.node_id, 1, len(data))
-                successful.append(node.node_id)
-        return successful
+        stored_size = 0
+        futures = {
+            self._executor.submit(self._write_to_node, node, chunk_id, data): node
+            for node in targets
+        }
+        for fut in as_completed(futures):
+            result = fut.result()
+            if result:
+                successful.append(result)
+                stored_size = len(prepare_chunk(data))  # same for all nodes
+        return successful, stored_size
 
     def ensure_replication(
         self,
@@ -279,10 +351,8 @@ class ReplicationManager:
         chunk_data: bytes,
         node_manager: NodeManager,
     ) -> List[str]:
-        """Re-replicate a chunk that is under-replicated. Returns new node list."""
         online  = {n.node_id for n in node_manager.online_nodes()}
-        current = set(chunk_meta.node_ids) & online  # healthy replicas
-
+        current = set(chunk_meta.node_ids) & online
         needed  = self.replication_factor - len(current)
         if needed <= 0:
             return list(current)
@@ -292,11 +362,14 @@ class ReplicationManager:
             if n.node_id not in current
         ][:needed]
 
-        for node in candidates:
-            ok = ChunkStore.write(node, chunk_meta.chunk_id, chunk_data)
-            if ok:
-                node_manager.update_node_stats(node.node_id, 1, chunk_meta.size)
-                current.add(node.node_id)
+        futures = {
+            self._executor.submit(self._write_to_node, node, chunk_meta.chunk_id, chunk_data): node
+            for node in candidates
+        }
+        for fut in as_completed(futures):
+            result = fut.result()
+            if result:
+                current.add(result)
 
         return list(current)
 
@@ -306,11 +379,9 @@ class ReplicationManager:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class IntegrityChecker:
-    """Validates chunk checksums against stored data."""
 
     @staticmethod
     def verify_chunk(node: NodeInfo, chunk_meta: ChunkMeta) -> Tuple[bool, str]:
-        """Returns (is_valid, message)."""
         data = ChunkStore.read(node, chunk_meta.chunk_id)
         if data is None:
             return False, f"Chunk {chunk_meta.chunk_id} missing on {node.node_id}"
@@ -323,11 +394,7 @@ class IntegrityChecker:
         return True, "OK"
 
     @staticmethod
-    def verify_file(
-        file_meta: FileMeta,
-        node_manager: NodeManager,
-    ) -> Dict[str, object]:
-        """Full integrity scan for all chunks of a file."""
+    def verify_file(file_meta: FileMeta, node_manager: NodeManager) -> Dict[str, object]:
         results = {"file_id": file_meta.file_id, "chunks": []}
         for cm in file_meta.chunks:
             chunk_results = []
@@ -351,7 +418,6 @@ class IntegrityChecker:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class FileRegistry:
-    """In-memory registry of all files and their chunk metadata."""
 
     def __init__(self):
         self._lock  = threading.RLock()
@@ -393,11 +459,14 @@ class FileRegistry:
                     "checksum":    fm.checksum,
                     "chunks": [
                         {
-                            "chunk_id": cm.chunk_id,
-                            "index":    cm.index,
-                            "size":     cm.size,
-                            "checksum": cm.checksum,
-                            "node_ids": cm.node_ids,
+                            "chunk_id":    cm.chunk_id,
+                            "index":       cm.index,
+                            "size":        cm.size,
+                            "stored_size": cm.stored_size,
+                            "checksum":    cm.checksum,
+                            "node_ids":    cm.node_ids,
+                            "compressed":  cm.compressed,
+                            "encrypted":   cm.encrypted,
                         }
                         for cm in fm.chunks
                     ],
@@ -412,7 +481,7 @@ class FileRegistry:
 class DistributedFileSystem:
     """
     High-level facade that orchestrates all DFS operations.
-    Thread-safe. Designed to be used by the Flask server.
+    Thread-safe. Features: compression, AES-256 encryption, concurrent replication.
     """
 
     def __init__(self, replication_factor: int = 2, initial_nodes: int = 3):
@@ -422,28 +491,22 @@ class DistributedFileSystem:
         self._event_log: List[dict] = []
         self._log_lock   = threading.Lock()
         self.replication_factor  = replication_factor
+        self.encryption_enabled  = ENCRYPTION_ENABLED
 
-        # Bootstrap nodes
         for i in range(1, initial_nodes + 1):
             self.node_manager.add_node(f"node_{i}")
 
-        # Start heartbeat background thread
         self._hb_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         self._hb_thread.start()
 
     # ── event log ─────────────────────────────────────────────────────────────
 
     def _log(self, event_type: str, message: str, **kwargs):
-        entry = {
-            "ts":      time.time(),
-            "type":    event_type,
-            "message": message,
-            **kwargs,
-        }
+        entry = {"ts": time.time(), "type": event_type, "message": message, **kwargs}
         with self._log_lock:
             self._event_log.append(entry)
-            if len(self._event_log) > 200:
-                self._event_log = self._event_log[-200:]
+            if len(self._event_log) > 300:
+                self._event_log = self._event_log[-300:]
 
     def get_events(self, since: float = 0) -> List[dict]:
         with self._log_lock:
@@ -454,22 +517,18 @@ class DistributedFileSystem:
     def _heartbeat_loop(self):
         while True:
             time.sleep(HEARTBEAT_INTERVAL)
-            # Simulate nodes sending heartbeats (all online nodes "check in")
             for node in self.node_manager.online_nodes():
                 self.node_manager.heartbeat(node.node_id)
-
             dead = self.node_manager.check_heartbeats()
             for node_id in dead:
                 self._log("node_failure", f"Node {node_id} declared DEAD (heartbeat timeout)", node_id=node_id)
                 self._re_replicate_for_dead_node(node_id)
 
     def _re_replicate_for_dead_node(self, dead_node_id: str):
-        """Re-replicate all chunks that were on the dead node."""
         for fm in self.file_registry.all_files():
             for cm in fm.chunks:
                 if dead_node_id not in cm.node_ids:
                     continue
-                # Try to find a healthy replica to read from
                 data = self._read_chunk_from_any_replica(cm)
                 if data is None:
                     self._log("replication_fail", f"Cannot re-replicate chunk {cm.chunk_id}: no healthy replica", chunk_id=cm.chunk_id)
@@ -487,7 +546,7 @@ class DistributedFileSystem:
                     return data
         return None
 
-    # ── file operations ───────────────────────────────────────────────────────
+    # ── concurrent upload ─────────────────────────────────────────────────────
 
     def upload_file(self, filename: str, data: bytes) -> FileMeta:
         file_id    = str(uuid.uuid4())
@@ -501,27 +560,39 @@ class DistributedFileSystem:
             checksum    = sha256_of(data),
         )
 
-        for idx, chunk_data in raw_chunks:
+        def process_chunk(idx_chunk):
+            idx, chunk_data = idx_chunk
             chunk_id   = str(uuid.uuid4())
             checksum   = sha256_of(chunk_data)
-            placed_on  = self.replication_manager.replicate_chunk(chunk_id, chunk_data, self.node_manager)
-
-            cm = ChunkMeta(
-                chunk_id = chunk_id,
-                file_id  = file_id,
-                index    = idx,
-                size     = len(chunk_data),
-                checksum = checksum,
-                node_ids = placed_on,
+            placed_on, stored_size = self.replication_manager.replicate_chunk(
+                chunk_id, chunk_data, self.node_manager
             )
-            file_meta.chunks.append(cm)
+            return ChunkMeta(
+                chunk_id    = chunk_id,
+                file_id     = file_id,
+                index       = idx,
+                size        = len(chunk_data),
+                stored_size = stored_size,
+                checksum    = checksum,
+                node_ids    = placed_on,
+                compressed  = True,
+                encrypted   = ENCRYPTION_ENABLED,
+            )
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="dfs-upload") as upload_executor:
+            futures  = [upload_executor.submit(process_chunk, ic) for ic in raw_chunks]
+            chunk_metas = [f.result() for f in as_completed(futures)]
+        chunk_metas.sort(key=lambda c: c.index)
+        file_meta.chunks = chunk_metas
 
         self.file_registry.register(file_meta)
-        self._log("upload", f"Uploaded '{filename}' ({len(data)} bytes, {len(raw_chunks)} chunks)", file_id=file_id)
+        compression_note = " | compressed+encrypted" if ENCRYPTION_ENABLED else " | compressed"
+        self._log("upload", f"Uploaded '{filename}' ({len(data)} bytes, {len(raw_chunks)} chunks{compression_note})", file_id=file_id)
         return file_meta
 
+    # ── download ──────────────────────────────────────────────────────────────
+
     def download_file(self, file_id: str) -> Tuple[Optional[bytes], Optional[str]]:
-        """Returns (assembled_data, filename) or (None, error_msg)."""
         fm = self.file_registry.get(file_id)
         if fm is None:
             return None, "File not found"
@@ -531,13 +602,14 @@ class DistributedFileSystem:
             data = self._read_chunk_from_any_replica(cm)
             if data is None:
                 return None, f"Chunk {cm.index} unavailable on all replicas"
-            # Integrity check
             if sha256_of(data) != cm.checksum:
                 return None, f"Chunk {cm.index} failed integrity check"
             assembled.extend(data)
 
         self._log("download", f"Downloaded '{fm.name}'", file_id=file_id)
         return bytes(assembled), fm.name
+
+    # ── delete ────────────────────────────────────────────────────────────────
 
     def delete_file(self, file_id: str) -> bool:
         fm = self.file_registry.delete(file_id)
@@ -548,7 +620,7 @@ class DistributedFileSystem:
                 node = self.node_manager.get_node(node_id)
                 if node:
                     ChunkStore.delete(node, cm.chunk_id)
-                    self.node_manager.update_node_stats(node_id, -1, -cm.size)
+                    self.node_manager.update_node_stats(node_id, -1, -cm.stored_size)
         self._log("delete", f"Deleted file '{fm.name}'", file_id=file_id)
         return True
 
@@ -578,13 +650,7 @@ class DistributedFileSystem:
         self._log("node_recovery", f"Node {node_id} recovering", node_id=node_id)
         return True
 
-    def delete_node(self, node_id: str) -> tuple:
-        """
-        Permanently remove a node from the cluster.
-        Must be OFFLINE first. Re-replicates any chunks that were on it
-        to remaining healthy nodes before evicting.
-        Returns (success: bool, message: str).
-        """
+    def delete_node(self, node_id: str) -> Tuple[bool, str]:
         node = self.node_manager.get_node(node_id)
         if not node:
             return False, "Node not found"
@@ -595,23 +661,21 @@ class DistributedFileSystem:
         if online_count < 1:
             return False, "No online nodes left to absorb the data"
 
-        # Re-replicate every chunk that lived on this node
         re_rep_count = 0
         for fm in self.file_registry.all_files():
             for cm in fm.chunks:
                 if node_id not in cm.node_ids:
                     continue
-                # Remove the dead node from the replica list before re-replicating
-                cm.node_ids = [nid for nid in cm.node_ids if nid != node_id]
+                
                 data = self._read_chunk_from_any_replica(cm)
                 if data is not None:
-                    new_nodes = self.replication_manager.ensure_replication(
-                        cm, data, self.node_manager
-                    )
+                    new_nodes = self.replication_manager.ensure_replication(cm, data, self.node_manager)
                     self.file_registry.update_chunk_nodes(fm.file_id, cm.chunk_id, new_nodes)
                     re_rep_count += 1
+                else:
+                    new_node_ids = [nid for nid in cm.node_ids if nid != node_id]
+                    self.file_registry.update_chunk_nodes(fm.file_id, cm.chunk_id, new_node_ids)
 
-        # Evict node from registry
         self.node_manager.remove_node(node_id)
         msg = f"Node {node_id} removed. Re-replicated {re_rep_count} chunk(s)."
         self._log("node_delete", msg, node_id=node_id)
@@ -624,7 +688,6 @@ class DistributedFileSystem:
         online_nodes = [n for n in all_nodes if n.status == NodeStatus.ONLINE]
         all_files    = self.file_registry.all_files()
 
-        # Files at risk: any chunk with fewer online replicas than replication_factor
         at_risk = 0
         for fm in all_files:
             for cm in fm.chunks:
@@ -648,11 +711,12 @@ class DistributedFileSystem:
             "total_bytes_stored": total_bytes,
             "replication_factor": self.replication_factor,
             "availability_pct":   round(availability, 1),
+            "encryption_enabled": ENCRYPTION_ENABLED,
+            "compression_enabled": True,
         }
 
-    def integrity_scan(self, file_id: str) -> dict:
+    def integrity_scan(self, file_id: str) -> Dict[str, object]:
         fm = self.file_registry.get(file_id)
         if not fm:
             return {"error": "File not found"}
         return IntegrityChecker.verify_file(fm, self.node_manager)
-# completed

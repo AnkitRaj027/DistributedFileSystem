@@ -128,6 +128,8 @@ def delete_file(file_id):
 @app.route("/api/integrity/<file_id>", methods=["GET"])
 def integrity_check(file_id):
     result = dfs.integrity_scan(file_id)
+    if "error" in result:
+        return jsonify(result), 404
     return jsonify(result)
 
 
