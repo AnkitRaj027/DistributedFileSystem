@@ -12,6 +12,10 @@ import io
 app = Flask(__name__, static_folder=".", static_url_path="")
 CORS(app)
 
+@app.before_request
+def before_request_tick():
+    dfs.tick()
+
 # ── Bootstrap DFS with 3 nodes, replication factor = 2 ────────────────────────
 dfs = DistributedFileSystem(replication_factor=2, initial_nodes=3)
 
@@ -156,6 +160,7 @@ def set_replication_factor():
         return jsonify({"error": "factor must be a positive integer"}), 400
     dfs.replication_manager.replication_factor = rf
     dfs.replication_factor = rf
+    dfs.save_state()
     return jsonify({"success": True, "replication_factor": rf})
 
 

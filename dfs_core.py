@@ -35,7 +35,10 @@ class NodeStatus(str, Enum):
 CHUNK_SIZE         = 512 * 1024   # 512 KB per chunk
 HEARTBEAT_INTERVAL = 2            # seconds between heartbeats
 HEARTBEAT_TIMEOUT  = 6            # seconds before node is declared dead
-DATA_DIR           = "data"       # root storage directory
+if os.environ.get("VERCEL"):
+    DATA_DIR = "/tmp/data"
+else:
+    DATA_DIR = "data"
 MAX_WORKERS        = 8            # thread pool size for parallel ops
 
 # Derive a stable 32-byte AES key from a master secret (in production, load from env/vault)
@@ -493,11 +496,154 @@ class DistributedFileSystem:
         self.replication_factor  = replication_factor
         self.encryption_enabled  = ENCRYPTION_ENABLED
 
-        for i in range(1, initial_nodes + 1):
-            self.node_manager.add_node(f"node_{i}")
+        # Try to load existing state
+        state_loaded = self.load_state()
+
+        if not state_loaded:
+            # Bootstrap default nodes
+            for i in range(1, initial_nodes + 1):
+                self.node_manager.add_node(f"node_{i}")
+            self._log("system", "DFS cluster initialized with default settings")
+            self.save_state()
 
         self._hb_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         self._hb_thread.start()
+
+    def save_state(self):
+        """Serialize current state (nodes, files, events) to disk for serverless persistence."""
+        state_path = os.path.join(DATA_DIR, "dfs_metadata.json")
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            nodes_data = []
+            for n in self.node_manager.all_nodes():
+                nodes_data.append({
+                    "node_id": n.node_id,
+                    "status": n.status.value,
+                    "storage_path": n.storage_path,
+                    "last_heartbeat": n.last_heartbeat,
+                    "chunks_stored": n.chunks_stored,
+                    "bytes_stored": n.bytes_stored,
+                    "total_capacity": n.total_capacity,
+                })
+            
+            files_data = []
+            for fm in self.file_registry.all_files():
+                files_data.append({
+                    "file_id": fm.file_id,
+                    "name": fm.name,
+                    "size": fm.size,
+                    "upload_time": fm.upload_time,
+                    "num_chunks": fm.num_chunks,
+                    "checksum": fm.checksum,
+                    "chunks": [
+                        {
+                            "chunk_id": cm.chunk_id,
+                            "file_id": cm.file_id,
+                            "index": cm.index,
+                            "size": cm.size,
+                            "stored_size": cm.stored_size,
+                            "checksum": cm.checksum,
+                            "node_ids": cm.node_ids,
+                            "compressed": cm.compressed,
+                            "encrypted": cm.encrypted,
+                        } for cm in fm.chunks
+                    ]
+                })
+
+            with self._log_lock:
+                events_data = list(self._event_log)
+
+            state = {
+                "replication_factor": self.replication_factor,
+                "nodes": nodes_data,
+                "files": files_data,
+                "events": events_data,
+            }
+            with open(state_path, "w") as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            print(f"[DFS] Failed to save state: {e}")
+
+    def load_state(self) -> bool:
+        """Deserialize state from disk if available."""
+        state_path = os.path.join(DATA_DIR, "dfs_metadata.json")
+        if not os.path.exists(state_path):
+            return False
+        try:
+            with open(state_path, "r") as f:
+                state = json.load(f)
+            
+            self.replication_factor = state.get("replication_factor", self.replication_factor)
+            self.replication_manager.replication_factor = self.replication_factor
+            
+            nodes_dict = {}
+            for n_data in state.get("nodes", []):
+                os.makedirs(n_data["storage_path"], exist_ok=True)
+                info = NodeInfo(
+                    node_id = n_data["node_id"],
+                    status = NodeStatus(n_data["status"]),
+                    storage_path = n_data["storage_path"],
+                    last_heartbeat = n_data["last_heartbeat"],
+                    chunks_stored = n_data.get("chunks_stored", 0),
+                    bytes_stored = n_data.get("bytes_stored", 0),
+                    total_capacity = n_data.get("total_capacity", 5 * 1024 * 1024 * 1024),
+                )
+                nodes_dict[info.node_id] = info
+            
+            with self.node_manager._lock:
+                self.node_manager._nodes = nodes_dict
+
+            files_dict = {}
+            for f_data in state.get("files", []):
+                fm = FileMeta(
+                    file_id = f_data["file_id"],
+                    name = f_data["name"],
+                    size = f_data["size"],
+                    upload_time = f_data["upload_time"],
+                    num_chunks = f_data["num_chunks"],
+                    checksum = f_data["checksum"],
+                )
+                chunks = []
+                for c_data in f_data.get("chunks", []):
+                    chunks.append(ChunkMeta(
+                        chunk_id = c_data["chunk_id"],
+                        file_id = c_data["file_id"],
+                        index = c_data["index"],
+                        size = c_data["size"],
+                        stored_size = c_data["stored_size"],
+                        checksum = c_data["checksum"],
+                        node_ids = c_data["node_ids"],
+                        compressed = c_data.get("compressed", True),
+                        encrypted = c_data.get("encrypted", True),
+                    ))
+                fm.chunks = chunks
+                files_dict[fm.file_id] = fm
+            
+            with self.file_registry._lock:
+                self.file_registry._files = files_dict
+
+            with self._log_lock:
+                self._event_log = state.get("events", [])
+            
+            print(f"[DFS] State loaded successfully from {state_path}")
+            return True
+        except Exception as e:
+            print(f"[DFS] Failed to load state: {e}")
+            return False
+
+    def tick(self):
+        """Simulate single clock cycle checks for recovering nodes in serverless env."""
+        now = time.time()
+        changed = False
+        with self.node_manager._lock:
+            for node in self.node_manager.all_nodes():
+                if node.status == NodeStatus.RECOVERING:
+                    if now - node.last_heartbeat > 2:
+                        node.status = NodeStatus.ONLINE
+                        self._log("node_online", f"Node {node.node_id} is now ONLINE after recovery", node_id=node.node_id)
+                        changed = True
+        if changed:
+            self.save_state()
 
     # ── event log ─────────────────────────────────────────────────────────────
 
@@ -525,6 +671,7 @@ class DistributedFileSystem:
                 self._re_replicate_for_dead_node(node_id)
 
     def _re_replicate_for_dead_node(self, dead_node_id: str):
+        replicated_any = False
         for fm in self.file_registry.all_files():
             for cm in fm.chunks:
                 if dead_node_id not in cm.node_ids:
@@ -536,6 +683,9 @@ class DistributedFileSystem:
                 new_nodes = self.replication_manager.ensure_replication(cm, data, self.node_manager)
                 self.file_registry.update_chunk_nodes(fm.file_id, cm.chunk_id, new_nodes)
                 self._log("replication", f"Re-replicated chunk {cm.chunk_id[:8]}… to {new_nodes}", chunk_id=cm.chunk_id)
+                replicated_any = True
+        if replicated_any:
+            self.save_state()
 
     def _read_chunk_from_any_replica(self, cm: ChunkMeta) -> Optional[bytes]:
         for node_id in cm.node_ids:
@@ -588,6 +738,7 @@ class DistributedFileSystem:
         self.file_registry.register(file_meta)
         compression_note = " | compressed+encrypted" if ENCRYPTION_ENABLED else " | compressed"
         self._log("upload", f"Uploaded '{filename}' ({len(data)} bytes, {len(raw_chunks)} chunks{compression_note})", file_id=file_id)
+        self.save_state()
         return file_meta
 
     # ── download ──────────────────────────────────────────────────────────────
@@ -622,6 +773,7 @@ class DistributedFileSystem:
                     ChunkStore.delete(node, cm.chunk_id)
                     self.node_manager.update_node_stats(node_id, -1, -cm.stored_size)
         self._log("delete", f"Deleted file '{fm.name}'", file_id=file_id)
+        self.save_state()
         return True
 
     # ── node operations ───────────────────────────────────────────────────────
@@ -631,6 +783,7 @@ class DistributedFileSystem:
         node_id  = f"node_{existing + 1}"
         info     = self.node_manager.add_node(node_id)
         self._log("node_add", f"Node {node_id} added to cluster", node_id=node_id)
+        self.save_state()
         return info
 
     def fail_node(self, node_id: str) -> bool:
@@ -640,6 +793,7 @@ class DistributedFileSystem:
         self.node_manager.fail_node(node_id)
         self._log("node_failure", f"Node {node_id} manually failed", node_id=node_id)
         self._re_replicate_for_dead_node(node_id)
+        self.save_state()
         return True
 
     def recover_node(self, node_id: str) -> bool:
@@ -648,6 +802,7 @@ class DistributedFileSystem:
             return False
         self.node_manager.recover_node(node_id)
         self._log("node_recovery", f"Node {node_id} recovering", node_id=node_id)
+        self.save_state()
         return True
 
     def delete_node(self, node_id: str) -> Tuple[bool, str]:
@@ -679,6 +834,7 @@ class DistributedFileSystem:
         self.node_manager.remove_node(node_id)
         msg = f"Node {node_id} removed. Re-replicated {re_rep_count} chunk(s)."
         self._log("node_delete", msg, node_id=node_id)
+        self.save_state()
         return True, msg
 
     # ── system stats ──────────────────────────────────────────────────────────
